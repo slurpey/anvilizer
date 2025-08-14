@@ -830,7 +830,7 @@ def process() -> Any:
         for style, file_path in style_paths.items():
             # Load image temporarily for preview
             img = Image.open(file_path).convert('RGBA')
-            img.thumbnail((150, 150))  # Smaller previews to save memory
+            img.thumbnail((400, 1400))  # Smaller previews to save memory
             buffered = io.BytesIO()
             img.save(buffered, format='PNG')
             preview_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
