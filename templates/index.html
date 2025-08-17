@@ -5,13 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SAP Anvil Tool</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
-    <!-- Cropper CSS (kept for consistency with your build) -->
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/cropper.min.css') }}">
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" type="image/x-icon">
 </head>
 <body>
     <div class="container">
         <div class="left-panel">
-            <h1 style="margin-top: 0; font-size: 1.6rem;">Lloyd's Anvil Maker</h1>
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 0; margin-bottom: 1rem;">
+                <h1 style="margin: 0; font-size: 1.6rem;">Lloyd's <span style="color: #0057D2; font-weight: bold;">Anvil</span><span style="color: black; font-weight: bold;">izer</span></h1>
+                <img src="{{ url_for('static', filename='images/saplogo.svg') }}" alt="SAP Logo" style="height: 32px; width: auto;">
+            </div>
 
             <div class="upload-control">
                 <label class="button">
@@ -36,10 +38,61 @@
 
             <!-- Modal for enlarged preview -->
             <div id="modal" class="modal" style="display: none;">
-                <div class="modal-content">
+                <div class="modal-content large-preview-modal">
                     <span id="close-modal" class="close-modal">&times;</span>
                     <img id="modal-image" src="" alt="Preview">
-                    <a id="modal-download" class="button" href="#" download>Download</a>
+                    <div class="modal-buttons">
+                        <a id="modal-download" class="button quick-download" href="#" download>Download</a>
+                        <button id="modal-advanced" class="button advanced-download">Advanced</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- High-Resolution Format Selection Modal -->
+            <div id="highres-modal" class="modal" style="display: none;">
+                <div class="modal-content highres-modal-content">
+                    <span id="close-highres-modal" class="close-modal">&times;</span>
+                    <h3>Print & Design Quality</h3>
+                    <p>Choose your preferred format for high-resolution download:</p>
+                    
+                    <div class="format-options">
+                        <label class="format-option">
+                            <input type="radio" name="format" value="png" checked>
+                            <div class="format-info">
+                                <strong>PNG - High Resolution</strong>
+                                <span>Flattened image up to 8K resolution (~30-50MB)</span>
+                            </div>
+                        </label>
+                        
+                        <label class="format-option">
+                            <input type="radio" name="format" value="layers">
+                            <div class="format-info">
+                                <strong>Layer Package - ZIP</strong>
+                                <span>Separate editable layers for professional editing (~80-120MB)</span>
+                            </div>
+                        </label>
+                    </div>
+                    
+                    <div class="format-details">
+                        <h4>Layer Package Contents:</h4>
+                        <ul>
+                            <li>01_background.png - Original cropped image</li>
+                            <li>02_subject_cutout.png - Extracted subject (if available)</li>
+                            <li>03_anvil_shape.png - Anvil overlay with transparency</li>
+                            <li>final_composite.png - Final flattened result</li>
+                            <li>README.txt - Usage instructions</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="processing-warning">
+                        <p>⏱️ <strong>Processing time:</strong> 1-3 minutes for 8K images</p>
+                        <p>💡 Works with Photoshop, GIMP, Figma, and other layer-capable editors</p>
+                    </div>
+                    
+                    <div class="modal-actions">
+                        <button id="cancel-highres" class="button secondary-button">Cancel</button>
+                        <button id="start-highres" class="button action-btn">Start Processing</button>
+                    </div>
                 </div>
             </div>
 
@@ -93,7 +146,10 @@
                 </div>
             </div>
 
-            <button id="generate-btn" class="button action-btn" disabled>Generate Styles</button>
+            <div style="display: flex; gap: 10px; margin-top: 15px;">
+                <button id="generate-btn" class="button action-btn" disabled style="flex: 1; margin-top: 0;">Generate Styles</button>
+                <button id="reset-btn" class="button" style="flex: 0 0 auto; margin-top: 0; padding: 8px 12px;">Reset</button>
+            </div>
 
             <div class="tip">
                 <p>Tip: SAP brand requires you to use images from the SAP Brand Library or Adobe Stock. If you don’t have a license, you can request one
@@ -104,8 +160,80 @@
         </div>
 
         <div class="right-panel">
-            <h2>Previews</h2>
-            <div id="previews" class="preview-grid"></div>
+            <h2 id="preview-title">Examples</h2>
+            <div id="example-instructions" class="example-instructions">
+                <p>After uploading an image, you can:</p>
+                <ul>
+                    <li>Zoom in and move your selection</li>
+                    <li>Move and resize the anvil shape</li>
+                    <li>Change the opacity of the anvil</li>
+                    <li>Choose from SAP brand-approved colors</li>
+                </ul>
+                <p><strong>Tips:</strong> Gradient and Flat styles work best with images without people. Human detection works better when the person is fully visible, not hidden behind objects.</p>
+                <p id="download-hint" style="display: none;"><strong>💡 Click on any preview image to download!</strong></p>
+            </div>
+            <div id="previews" class="preview-grid">
+                <!-- Sample previews shown by default -->
+                <div class="preview-item sample-preview clickable-preview" data-style="Window">
+                    <img src="{{ url_for('static', filename='images/previews/sample_window.png') }}" alt="Window Style Sample">
+                    <div class="preview-overlay">
+                        <span class="preview-title">Window</span>
+                        <div class="preview-actions">
+                            <span class="click-hint">📥 Click to download</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="preview-item sample-preview clickable-preview" data-style="Silhouette">
+                    <img src="{{ url_for('static', filename='images/previews/sample_silhouette.png') }}" alt="Silhouette Style Sample">
+                    <div class="preview-overlay">
+                        <span class="preview-title">Silhouette</span>
+                        <div class="preview-actions">
+                            <span class="click-hint">📥 Click to download</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="preview-item sample-preview clickable-preview" data-style="Stroke">
+                    <img src="{{ url_for('static', filename='images/previews/sample_stroke.png') }}" alt="Stroke Style Sample">
+                    <div class="preview-overlay">
+                        <span class="preview-title">Stroke</span>
+                        <div class="preview-actions">
+                            <span class="click-hint">📥 Click to download</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="preview-item sample-preview clickable-preview" data-style="Gradient Silhouette">
+                    <img src="{{ url_for('static', filename='images/previews/sample_gradient_silhouette.png') }}" alt="Gradient Silhouette Style Sample">
+                    <div class="preview-overlay">
+                        <span class="preview-title">Gradient Silhouette</span>
+                        <div class="preview-actions">
+                            <span class="click-hint">📥 Click to download</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="preview-item sample-preview clickable-preview" data-style="Gradient">
+                    <img src="{{ url_for('static', filename='images/previews/sample_gradient.png') }}" alt="Gradient Style Sample">
+                    <div class="preview-overlay">
+                        <span class="preview-title">Gradient</span>
+                        <div class="preview-actions">
+                            <span class="click-hint">📥 Click to download</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="preview-item sample-preview clickable-preview" data-style="Flat">
+                    <img src="{{ url_for('static', filename='images/previews/sample_flat.png') }}" alt="Flat Style Sample">
+                    <div class="preview-overlay">
+                        <span class="preview-title">Flat</span>
+                        <div class="preview-actions">
+                            <span class="click-hint">📥 Click to download</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Usage counter positioned at bottom right -->
+            <div id="usage-counter" class="usage-counter bottom-right">
+                <span id="counter-text">🎯 0 images processed</span>
+            </div>
         </div>
     </div>
 
@@ -117,8 +245,17 @@
         </div>
     </div>
 
+    <!-- High-resolution processing overlay -->
+    <div id="highres-loading-overlay" class="loading-overlay highres-loading" style="display: none;">
+        <div class="loading-container">
+            <div class="spinner large-spinner"></div>
+            <div class="loading-text">Processing High-Resolution Image...</div>
+            <div class="loading-subtext">This may take 30-60 seconds for 8K images</div>
+            <div class="processing-status-text">Please wait while we enhance your image...</div>
+        </div>
+    </div>
+
     <!-- JS -->
-    <script src="{{ url_for('static', filename='js/cropper.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/script.js') }}"></script>
 </body>
 </html>

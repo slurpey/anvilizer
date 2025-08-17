@@ -30,12 +30,8 @@ let anvilScale = 0.7; // 0.5 to 1.0
 let anvilOffsetX = 0.0; // -1 to 1
 let anvilOffsetY = 0.0; // -1 to 1
 
-// Cropper.js instance
-// We disable Cropper usage in this build to retain the custom crop box
-// functionality.  The variable remains for compatibility but is never
-// initialised.  If Cropper is later enabled, this variable can be
-// assigned a Cropper instance.
-let cropper = null;
+// Pure vanilla JavaScript implementation - no external libraries
+// All cropping functionality is handled by custom crop box
 
 // Opacity slider for silhouette style
 const opacitySlider = document.getElementById('opacity-slider');
@@ -69,61 +65,14 @@ function updateGenerateButton() {
 }
 
 // Helper called whenever the crop box changes.  It updates the mask
-// overlays and the anvil preview based on the current crop box
-// dimensions.  When using Cropper.js, this function retrieves the
-// crop box data from the cropper instance instead of relying on our
-// custom crop box element.
+// overlays and the anvil preview based on the current crop box dimensions.
 function updateMaskAndAnvil() {
     updateCropMask();
     updateAnvilPreview();
 }
 
-// Initialise Cropper.js on the loaded image.  This will replace the
-// custom crop box and use Cropper's built‑in crop box UI.  The aspect
-// ratio is set according to currentRatio.  When the crop box is
-// changed by the user, the 'crop' event triggers updates for the
-// dark overlay masks and the anvil preview.
-function initCropper() {
-    if (cropper) {
-        cropper.destroy();
-        cropper = null;
-    }
-    cropper = new Cropper(imageElement, {
-        viewMode: 1,
-        aspectRatio: currentRatio,
-        autoCropArea: 1.0,
-        responsive: true,
-        background: false,
-        zoomOnWheel: false,
-        ready() {
-            // Hide the custom crop box element as Cropper handles
-            // cropping UI internally
-            cropBox.style.display = 'none';
-            // Ensure mask overlays are visible
-            maskTop.style.display = 'block';
-            maskLeft.style.display = 'block';
-            maskRight.style.display = 'block';
-            maskBottom.style.display = 'block';
-            // Set zoom slider defaults
-            zoomSlider.min = '0.3';
-            zoomSlider.max = '1';
-            zoomSlider.step = '0.01';
-            zoomSlider.value = '1';
-            // Perform initial mask and anvil update
-            updateMaskAndAnvil();
-            // Set the crop box to the maximum size corresponding to the
-            // current ratio.  This ensures that the initial view
-            // reflects the full image when possible.  Without this,
-            // Cropper may choose a default crop that does not match
-            // our zoom slider behaviour.
-            updateCropBoxForZoom();
-        },
-        crop() {
-            // Update overlays whenever the crop box changes
-            updateMaskAndAnvil();
-        }
-    });
-}
+// Custom crop box implementation only - no external libraries needed
+// All cropping is handled by the custom crop box element
 
 // File input change handler
 fileInput.addEventListener('change', function (e) {
@@ -223,16 +172,8 @@ function setupCropBox() {
 document.querySelectorAll('input[name="ratio"]').forEach(function (elem) {
     elem.addEventListener('change', function () {
         currentRatio = this.value === '1:1' ? 1 : 16 / 9;
-        // Update Cropper aspect ratio if initialised
-        if (cropper) {
-            // If Cropper is ever enabled, update its aspect ratio and reset zoom
-            cropper.setAspectRatio(currentRatio);
-            zoomSlider.value = '1';
-            updateCropBoxForZoom();
-        } else {
-            // For the custom crop box, rebuild it to match the new ratio
-            setupCropBox();
-        }
+        // For the custom crop box, rebuild it to match the new ratio
+        setupCropBox();
         // Update mask and anvil preview to reflect the ratio change
         updateCropMask();
         updateAnvilPreview();
@@ -304,95 +245,58 @@ if (fitButton) {
     });
 }
 
-// Update the crop box dimensions based on the zoom slider value.  The
-// crop box shrinks as the user zooms in (value < 1).  The centre of
-// the box is preserved where possible.
+// Update the crop box dimensions based on the zoom slider value.
+// Custom crop box logic: adjust the cropBox element itself.
 function updateCropBoxForZoom() {
-    // When using Cropper.js, adjust via Cropper's API.  Otherwise,
-    // adjust the custom crop box element.  The zoom slider controls
-    // the fraction of the maximum crop size (1 = max).  Preserve
-    // the centre of the existing crop box when resizing and clamp
-    // within the wrapper or container boundaries.
-    if (cropper) {
-        const zoomFactor = parseFloat(zoomSlider.value);
-        const containerData = cropper.getContainerData();
-        let baseW, baseH;
-        if ((containerData.width / currentRatio) <= containerData.height) {
-            baseW = containerData.width;
-            baseH = baseW / currentRatio;
-        } else {
-            baseH = containerData.height;
-            baseW = baseH * currentRatio;
-        }
-        const newW = baseW * zoomFactor;
-        const newH = baseH * zoomFactor;
-        const cropBoxData = cropper.getCropBoxData();
-        let centerX = cropBoxData.left + cropBoxData.width / 2;
-        let centerY = cropBoxData.top + cropBoxData.height / 2;
-        let newLeft = centerX - newW / 2;
-        let newTop = centerY - newH / 2;
-        if (newLeft < 0) newLeft = 0;
-        if (newTop < 0) newTop = 0;
-        if (newLeft + newW > containerData.width) newLeft = containerData.width - newW;
-        if (newTop + newH > containerData.height) newTop = containerData.height - newH;
-        cropper.setCropBoxData({ left: newLeft, top: newTop, width: newW, height: newH });
-        // Update overlays
-        updateMaskAndAnvil();
-    } else {
-        // Custom crop box logic: adjust the cropBox element itself.
-        if (!cropBox || cropBox.style.display === 'none') return;
-        const zoomFactor = parseFloat(zoomSlider.value);
-        const newW = maxCropWidth * zoomFactor;
-        const newH = maxCropHeight * zoomFactor;
-        const wrapperW = cropWrapper.clientWidth;
-        const wrapperH = cropWrapper.clientHeight;
-        // Determine current centre of the crop box
-        let currentW = parseFloat(cropBox.style.width);
-        let currentH = parseFloat(cropBox.style.height);
-        let centerX = parseFloat(cropBox.style.left) + currentW / 2;
-        let centerY = parseFloat(cropBox.style.top) + currentH / 2;
-        // Compute new top-left so that centre remains at same coordinates
-        let newLeft = centerX - newW / 2;
-        let newTop = centerY - newH / 2;
-        // Clamp within wrapper boundaries
-        newLeft = Math.max(0, Math.min(newLeft, wrapperW - newW));
-        newTop = Math.max(0, Math.min(newTop, wrapperH - newH));
-        cropBox.style.width = newW + 'px';
-        cropBox.style.height = newH + 'px';
-        cropBox.style.left = newLeft + 'px';
-        cropBox.style.top = newTop + 'px';
-        // Update overlays
-        updateAnvilPreview();
-        updateCropMask();
-    }
+    if (!cropBox || cropBox.style.display === 'none') return;
+    
+    const zoomFactor = parseFloat(zoomSlider.value);
+    const newW = maxCropWidth * zoomFactor;
+    const newH = maxCropHeight * zoomFactor;
+    const wrapperW = cropWrapper.clientWidth;
+    const wrapperH = cropWrapper.clientHeight;
+    
+    // Determine current centre of the crop box
+    let currentW = parseFloat(cropBox.style.width);
+    let currentH = parseFloat(cropBox.style.height);
+    let centerX = parseFloat(cropBox.style.left) + currentW / 2;
+    let centerY = parseFloat(cropBox.style.top) + currentH / 2;
+    
+    // Compute new top-left so that centre remains at same coordinates
+    let newLeft = centerX - newW / 2;
+    let newTop = centerY - newH / 2;
+    
+    // Clamp within wrapper boundaries
+    newLeft = Math.max(0, Math.min(newLeft, wrapperW - newW));
+    newTop = Math.max(0, Math.min(newTop, wrapperH - newH));
+    
+    cropBox.style.width = newW + 'px';
+    cropBox.style.height = newH + 'px';
+    cropBox.style.left = newLeft + 'px';
+    cropBox.style.top = newTop + 'px';
+    
+    // Update overlays
+    updateAnvilPreview();
+    updateCropMask();
 }
 
 // Update mask overlay positions and sizes based on crop box
 function updateCropMask() {
-    // When using Cropper.js, obtain the crop box data from the cropper.
-    // Otherwise fall back to the manual crop box values.  If neither are
-    // available, do nothing.
     const wrapperWidth = cropWrapper.clientWidth;
     const wrapperHeight = cropWrapper.clientHeight;
     let cropLeft, cropTop, cropW, cropH;
-    if (cropper) {
-        const box = cropper.getCropBoxData();
-        const container = cropper.getContainerData();
-        // Adjust crop coordinates relative to the cropWrapper by
-        // subtracting the container's offset (usually 0,0)
-        cropLeft = box.left - container.left;
-        cropTop = box.top - container.top;
-        cropW = box.width;
-        cropH = box.height;
-    } else if (cropBox && cropBox.style.display !== 'none') {
+    
+    if (cropBox && cropBox.style.display !== 'none') {
         cropLeft = parseFloat(cropBox.style.left);
         cropTop = parseFloat(cropBox.style.top);
         cropW = parseFloat(cropBox.style.width);
         cropH = parseFloat(cropBox.style.height);
     }
+    
     if (cropLeft == null || isNaN(cropLeft) || cropTop == null || isNaN(cropTop) || cropW == null || isNaN(cropW) || cropH == null || isNaN(cropH)) {
         return;
     }
+    
     // Top overlay
     maskTop.style.top = '0px';
     maskTop.style.left = '0px';
@@ -444,25 +348,17 @@ function updateImagePosition() {
 
 // Update anvil overlay preview based on current crop box, scale and offsets
 function updateAnvilPreview() {
-    // Determine the crop box dimensions.  Use Cropper.js if available,
-    // otherwise fall back to the manual crop box values.  If neither
-    // exist, exit early.
     let cropW, cropH, cropLeft, cropTop;
-    if (cropper) {
-        const box = cropper.getCropBoxData();
-        const container = cropper.getContainerData();
-        cropW = box.width;
-        cropH = box.height;
-        // Convert crop box coordinates to the cropWrapper coordinate system
-        cropLeft = box.left - container.left;
-        cropTop = box.top - container.top;
-    } else if (cropBox && cropBox.style.display !== 'none') {
+    
+    if (cropBox && cropBox.style.display !== 'none') {
         cropW = parseFloat(cropBox.style.width);
         cropH = parseFloat(cropBox.style.height);
         cropLeft = parseFloat(cropBox.style.left);
         cropTop = parseFloat(cropBox.style.top);
     }
+    
     if (cropW == null || isNaN(cropW) || cropH == null || isNaN(cropH)) return;
+    
     // Compute anvil dimensions relative to crop box
     // Desired width and height from current anvilScale (0.5–1)
     let aw = cropW * anvilScale;
@@ -511,52 +407,134 @@ if (anvilOffsetYSlider) {
     });
 }
 
+// Reset button functionality
+function resetAllSliders() {
+    // Reset all sliders to their default values
+    if (zoomSlider) {
+        zoomSlider.value = '1';
+        updateCropBoxForZoom();
+    }
+    if (anvilSizeSlider) {
+        anvilSizeSlider.value = '70';
+        anvilScale = 0.7;
+        updateAnvilPreview();
+    }
+    if (anvilOffsetXSlider) {
+        anvilOffsetXSlider.value = '0';
+        anvilOffsetX = 0.0;
+        updateAnvilPreview();
+    }
+    if (anvilOffsetYSlider) {
+        anvilOffsetYSlider.value = '0';
+        anvilOffsetY = 0.0;
+        updateAnvilPreview();
+    }
+    if (opacitySlider) {
+        opacitySlider.value = '50';
+    }
+    
+    // Reset aspect ratio to 16:9
+    const ratio16x9 = document.querySelector('input[name="ratio"][value="16:9"]');
+    if (ratio16x9) {
+        ratio16x9.checked = true;
+        currentRatio = 16 / 9;
+        if (imageElement.src) {
+            setupCropBox();
+        }
+    }
+    
+    // Clear color selection
+    document.querySelectorAll('.colour-swatch').forEach(function (s) {
+        s.classList.remove('selected');
+    });
+    selectedColour = null;
+    updateGenerateButton();
+}
+
+// Reset button click handler
+const resetBtn = document.getElementById('reset-btn');
+if (resetBtn) {
+    resetBtn.addEventListener('click', resetAllSliders);
+}
+
 // Generate button click
 generateBtn.addEventListener('click', function () {
     if (!imageElement.src || !selectedColour) return;
-    // Use Cropper.js to generate the cropped region at the target
-    // resolution.  This ensures that the selected region in the UI
-    // exactly matches what is sent to the backend.  If Cropper is not
-    // initialised, fall back to the original image without cropping.
-    let dataUrl;
+    
+    // Custom crop box implementation - compute the crop based on the crop box
     const ratioValue = document.querySelector('input[name="ratio"]:checked').value;
-    let targetW = 1920;
-    let targetH = ratioValue === '1:1' ? 1920 : 1080;
-    if (cropper) {
-        const canvas = cropper.getCroppedCanvas({
-            width: targetW,
-            height: targetH,
-            imageSmoothingEnabled: true,
-            imageSmoothingQuality: 'high',
-            fillColor: '#00000000'
-        });
-        dataUrl = canvas.toDataURL('image/png');
+    
+    // TWO-TIER APPROACH: Preview processing vs High-res processing
+    // For PREVIEW generation: Use moderate resolution for speed (1920x1080)
+    // For HIGH-RES processing: Use original crop dimensions (stored separately)
+    let previewTargetW = 1920;
+    let previewTargetH = ratioValue === '1:1' ? 1920 : 1080;
+    
+    // Determine the bounding rectangles of the displayed image and the crop box
+    const imgRect = imageElement.getBoundingClientRect();
+    const cropRect = cropBox.getBoundingClientRect();
+    const imgNatW = imageElement.naturalWidth;
+    const imgNatH = imageElement.naturalHeight;
+    
+    // Calculate the selected region in natural image coordinates
+    let sx = ((cropRect.left - imgRect.left) / imgRect.width) * imgNatW;
+    let sy = ((cropRect.top - imgRect.top) / imgRect.height) * imgNatH;
+    let sw = (cropRect.width / imgRect.width) * imgNatW;
+    let sh = (cropRect.height / imgRect.height) * imgNatH;
+    
+    // Clamp to image boundaries
+    sx = Math.max(0, Math.min(sx, imgNatW));
+    sy = Math.max(0, Math.min(sy, imgNatH));
+    sw = Math.max(1, Math.min(sw, imgNatW - sx));
+    sh = Math.max(1, Math.min(sh, imgNatH - sy));
+    
+    console.log(`Original image: ${imgNatW}x${imgNatH}, Crop region: ${sw.toFixed(0)}x${sh.toFixed(0)}`);
+    
+    // PREVIEW PROCESSING: Create downscaled version for fast preview generation
+    const previewCanvas = document.createElement('canvas');
+    previewCanvas.width = previewTargetW;
+    previewCanvas.height = previewTargetH;
+    const previewCtx = previewCanvas.getContext('2d');
+    
+    // Draw the cropped region scaled to preview resolution
+    previewCtx.drawImage(imageElement, sx, sy, sw, sh, 0, 0, previewTargetW, previewTargetH);
+    const previewDataUrl = previewCanvas.toDataURL('image/png');
+    
+    // HIGH-RES PROCESSING: Store original crop data for later high-res processing
+    // Calculate optimal high-res output dimensions (preserve aspect ratio)
+    const cropAspectRatio = sw / sh;
+    let highresW, highresH;
+    
+    if (ratioValue === '1:1') {
+        // For square images, use the smaller dimension to maintain square
+        const maxDim = Math.min(sw, sh);
+        highresW = maxDim;
+        highresH = maxDim;
     } else {
-        // No cropper instance; compute the crop based on the custom crop box
-        // Determine the bounding rectangles of the displayed image and the crop box.
-        const imgRect = imageElement.getBoundingClientRect();
-        const cropRect = cropBox.getBoundingClientRect();
-        const imgNatW = imageElement.naturalWidth;
-        const imgNatH = imageElement.naturalHeight;
-        // Calculate the selected region in natural image coordinates
-        let sx = ((cropRect.left - imgRect.left) / imgRect.width) * imgNatW;
-        let sy = ((cropRect.top - imgRect.top) / imgRect.height) * imgNatH;
-        let sw = (cropRect.width / imgRect.width) * imgNatW;
-        let sh = (cropRect.height / imgRect.height) * imgNatH;
-        // Clamp to image boundaries
-        sx = Math.max(0, Math.min(sx, imgNatW));
-        sy = Math.max(0, Math.min(sy, imgNatH));
-        sw = Math.max(1, Math.min(sw, imgNatW - sx));
-        sh = Math.max(1, Math.min(sh, imgNatH - sy));
-        // Create a canvas and draw the cropped region at the target resolution
-        const canvas = document.createElement('canvas');
-        canvas.width = targetW;
-        canvas.height = targetH;
-        const ctx = canvas.getContext('2d');
-        // Draw the cropped region scaled to the target output size
-        ctx.drawImage(imageElement, sx, sy, sw, sh, 0, 0, targetW, targetH);
-        dataUrl = canvas.toDataURL('image/png');
+        // For 16:9, preserve the crop dimensions up to reasonable limits
+        highresW = sw;
+        highresH = sh;
     }
+    
+    // Create high-resolution canvas with ORIGINAL crop dimensions
+    const highresCanvas = document.createElement('canvas');
+    highresCanvas.width = highresW;
+    highresCanvas.height = highresH;
+    const highresCtx = highresCanvas.getContext('2d');
+    
+    // Draw at FULL RESOLUTION - no downscaling
+    highresCtx.drawImage(imageElement, sx, sy, sw, sh, 0, 0, highresW, highresH);
+    const highresDataUrl = highresCanvas.toDataURL('image/png');
+    
+    console.log(`Preview resolution: ${previewTargetW}x${previewTargetH}, High-res: ${highresW}x${highresH}`);
+    
+    // Store high-res data globally for later use
+    window.currentHighResData = {
+        dataUrl: highresDataUrl,
+        dimensions: { width: highresW, height: highresH },
+        originalCrop: { sx, sy, sw, sh },
+        naturalDimensions: { width: imgNatW, height: imgNatH }
+    };
     // Convert opacity slider (0-100) to 0-1 range
     const opacityValue = opacitySlider ? parseFloat(opacitySlider.value) / 100.0 : 0.5;
     // Prepare anvil parameters for backend
@@ -571,7 +549,8 @@ generateBtn.addEventListener('click', function () {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-            imageData: dataUrl,
+            imageData: previewDataUrl,  // Use preview resolution for fast processing
+            highResData: highresDataUrl, // Store high-res data for later use
             ratio: ratioValue,
             colour: selectedColour,
             opacity: opacityValue,
@@ -588,6 +567,8 @@ generateBtn.addEventListener('click', function () {
                 return;
             }
             renderPreviews(data.uid, data.previews);
+            // Update counter after successful processing
+            loadUsageStats();
             // Hide loading overlay after previews rendered
             if (loadingOverlay) {
                 loadingOverlay.style.display = 'none';
@@ -606,6 +587,21 @@ generateBtn.addEventListener('click', function () {
 function renderPreviews(uid, previews) {
     const container = document.getElementById('previews');
     container.innerHTML = '';
+    
+    // Change title from "Examples" to "Previews" and show download hint
+    const title = document.getElementById('preview-title');
+    const instructions = document.getElementById('example-instructions');
+    const downloadHint = document.getElementById('download-hint');
+    if (title) {
+        title.textContent = 'Previews';
+    }
+    if (instructions) {
+        instructions.style.display = 'none';
+    }
+    if (downloadHint) {
+        downloadHint.style.display = 'block';
+    }
+    
     // Mapping of internal style keys to human‑friendly labels for display
     const labelMap = {
         'Gradient Silhouette': 'Gradient Silhouette',
@@ -615,92 +611,183 @@ function renderPreviews(uid, previews) {
         'Flat': 'Flat',
         'Window': 'Window'
     };
-    Object.keys(previews).forEach(function (style) {
+    
+    // Define the same order as the example template: Window, Silhouette, Stroke, Gradient Silhouette, Gradient, Flat
+    const orderedStyles = ['Window', 'Silhouette', 'Stroke', 'Gradient Silhouette', 'Gradient', 'Flat'];
+    
+    orderedStyles.forEach(function (style) {
+        if (!previews[style]) return; // Skip if this style doesn't exist in the response
         const previewData = previews[style];
+        
+        // Create preview card with new simplified download interface
         const card = document.createElement('div');
         card.className = 'preview-card';
+        
         const img = document.createElement('img');
-        // Base64 encoded preview thumbnail
         img.src = 'data:image/png;base64,' + previewData;
-        // Store preview data and style on the element for the modal
-        img.dataset.preview = previewData;
-        img.dataset.style = style;
-        // Click handler to open modal with larger view.  The modal will
-        // display the preview using the base64 data (to avoid broken
-        // network requests) while the download link points to the high
-        // resolution asset on the server.
+        img.alt = style + ' Style Preview';
         img.style.cursor = 'pointer';
-        img.addEventListener('click', function () {
-            const modal = document.getElementById('modal');
-            const modalImg = document.getElementById('modal-image');
-            const modalDownload = document.getElementById('modal-download');
-            const styleName = this.dataset.style;
-            // Set download link for full resolution asset
-            modalDownload.href = `/download/${uid}/${styleName}`;
-            // Compose a friendly filename using the original file name, style and colour
-            const extIndex = uploadFilename.lastIndexOf('.');
-            const baseName = extIndex >= 0 ? uploadFilename.slice(0, extIndex) : uploadFilename;
-            const colourName = (selectedColour || '').replace('#', '');
-            const slugStyle = styleName.toLowerCase().replace(/\s+/g, '');
-            modalDownload.download = `${baseName}_${slugStyle}_${colourName}.png`;
-            // Fetch the high resolution image and display it in the modal.  This
-            // ensures the preview is large and sharp.
-            fetch(`/download/${uid}/${styleName}`)
-                .then(response => response.blob())
-                .then(blob => {
-                    const url = URL.createObjectURL(blob);
-                    modalImg.src = url;
-                })
-                .catch(() => {
-                    // If fetch fails, fall back to the thumbnail preview
-                    modalImg.src = 'data:image/png;base64,' + this.dataset.preview;
-                });
-            modal.style.display = 'flex';
+        
+        // Click handler to show larger preview in modal
+        img.addEventListener('click', function() {
+            showPreviewModal(uid, style, this.src);
         });
+        
         const info = document.createElement('div');
         info.className = 'info';
+        
         const name = document.createElement('span');
-        const displayName = labelMap[style] || style;
-        name.textContent = displayName;
-        // Create a download link instead of a button.  The file name will
-        // be provided by the server based on meta.json, so the download
-        // attribute can be left unset.  Styling is handled via CSS to
-        // match the appearance of buttons.
-        const link = document.createElement('a');
-        link.textContent = 'Download';
-        link.href = `/download/${uid}/${style}`;
-        link.setAttribute('target', '_blank');
-        // Add the button class for consistent styling
-        link.className = 'download-link';
+        name.textContent = labelMap[style] || style;
+        
+        // Simplified download buttons
+        const downloadButtons = document.createElement('div');
+        downloadButtons.className = 'download-buttons';
+        
+        // Primary download button
+        const downloadBtn = document.createElement('a');
+        downloadBtn.textContent = 'Download';
+        downloadBtn.href = `/download/${uid}/${style}`;
+        downloadBtn.className = 'button quick-download';
+        downloadBtn.setAttribute('target', '_blank');
+        
+        // Advanced download button
+        const advancedBtn = document.createElement('button');
+        advancedBtn.textContent = 'Advanced';
+        advancedBtn.className = 'button advanced-download';
+        advancedBtn.addEventListener('click', function() {
+            openHighResModal(uid, style);
+        });
+        
+        downloadButtons.appendChild(downloadBtn);
+        downloadButtons.appendChild(advancedBtn);
+        
         info.appendChild(name);
-        info.appendChild(link);
+        info.appendChild(downloadButtons);
         card.appendChild(img);
         card.appendChild(info);
         container.appendChild(card);
     });
+    
     // Create download all button
-    // Add a small "Download All" button below the grid
     const allBtn = document.createElement('button');
     allBtn.textContent = 'Download All';
-    allBtn.className = 'button';
-    // Use inline styles to keep the button compact and consistent with other
-    // controls. Set fixed dimensions to prevent scaling with browser zoom.
-    allBtn.style.marginTop = '12px';
-    allBtn.style.padding = '8px 16px';
-    allBtn.style.width = '120px';
-    allBtn.style.height = '32px';
-    allBtn.style.fontSize = '14px';
-    allBtn.style.boxSizing = 'border-box';
-    allBtn.style.display = 'block';
-    allBtn.style.flexShrink = '0';
-    allBtn.style.minWidth = '120px';
-    allBtn.style.maxWidth = '120px';
+    allBtn.className = 'button action-btn enabled';
     allBtn.addEventListener('click', function () {
         const url = `/download_all/${uid}`;
         window.open(url, '_blank');
     });
     container.appendChild(allBtn);
 }
+
+// Show preview modal with larger image (not full resolution)
+function showPreviewModal(uid, style, imageSrc) {
+    const modal = document.getElementById('modal');
+    const modalImg = document.getElementById('modal-image');
+    const modalDownload = document.getElementById('modal-download');
+    const modalAdvanced = document.getElementById('modal-advanced');
+    
+    if (!modal || !modalImg) return;
+    
+    // Set the larger preview image - use full download URL for generated images, or full-size samples
+    if (uid && style) {
+        // Generated image - use download URL
+        modalImg.src = `/download/${uid}/${encodeURIComponent(style)}`;
+    } else {
+        // Sample image - use full-size sample instead of tiny thumbnail
+        const styleMap = {
+            'Window': '/static/images/AdobeStock_707229709_window_Blue2.png',
+            'Silhouette': '/static/images/AdobeStock_707229709_silhouette_Blue2.png',
+            'Stroke': '/static/images/AdobeStock_707229709_stroke_Blue2.png',
+            'Gradient Silhouette': '/static/images/AdobeStock_707229709_gradient silhouette_Blue2.png',
+            'Gradient': '/static/images/AdobeStock_707229709_gradient_Blue2.png',
+            'Flat': '/static/images/AdobeStock_707229709_flat_Blue2.png'
+        };
+        modalImg.src = styleMap[style] || imageSrc;
+    }
+    
+    // Always show buttons, but configure them differently for samples vs generated images
+    if (modalDownload) modalDownload.style.display = 'inline-block';
+    if (modalAdvanced) modalAdvanced.style.display = 'inline-block';
+    
+    if (uid && style) {
+        // Generated image - enable full functionality
+        modalDownload.href = `/download/${uid}/${style}`;
+        modalDownload.style.opacity = '1';
+        modalDownload.style.pointerEvents = 'auto';
+        
+        // Create friendly filename
+        const extIndex = uploadFilename.lastIndexOf('.');
+        const baseName = extIndex >= 0 ? uploadFilename.slice(0, extIndex) : uploadFilename;
+        const colourName = (selectedColour || '').replace('#', '');
+        const slugStyle = style.toLowerCase().replace(/\s+/g, '');
+        modalDownload.download = `${baseName}_${slugStyle}_${colourName}.png`;
+        
+        // Configure advanced button
+        if (modalAdvanced) {
+            modalAdvanced.style.opacity = '1';
+            modalAdvanced.style.pointerEvents = 'auto';
+            modalAdvanced.onclick = function() {
+                modal.style.display = 'none'; // Close preview modal first
+                openHighResModal(uid, style);
+            };
+        }
+    } else {
+        // Sample image - disable buttons but keep them visible for layout
+        modalDownload.href = '#';
+        modalDownload.style.opacity = '0.5';
+        modalDownload.style.pointerEvents = 'none';
+        modalDownload.removeAttribute('download');
+        
+        if (modalAdvanced) {
+            modalAdvanced.style.opacity = '0.5';
+            modalAdvanced.style.pointerEvents = 'none';
+            modalAdvanced.onclick = null;
+        }
+    }
+    
+    // Show modal
+    modal.style.display = 'flex';
+}
+
+// Handle sample and generated preview clicks
+function setupSamplePreviews() {
+    // Handle sample preview clicks (before any image is uploaded)
+    document.querySelectorAll('.sample-preview.clickable-preview').forEach(function(previewItem) {
+        previewItem.addEventListener('click', function(e) {
+            const img = this.querySelector('img');
+            const styleName = this.dataset.style;
+            
+            // Show larger preview without download option
+            showPreviewModal(null, styleName, img.src);
+        });
+    });
+    
+    // Show download hint when previews are generated
+    const downloadHint = document.getElementById('download-hint');
+    if (downloadHint) {
+        downloadHint.style.display = 'block';
+    }
+}
+
+// Handle clicks on generated preview images
+function setupGeneratedPreviews() {
+    document.querySelectorAll('.preview-item.clickable-preview').forEach(function(previewItem) {
+        previewItem.addEventListener('click', function(e) {
+            // Only handle clicks on generated previews, not samples
+            if (this.classList.contains('sample-preview')) return;
+            
+            const img = this.querySelector('img');
+            const styleName = this.dataset.style;
+            const uid = this.dataset.uid; // We'll need to set this when creating previews
+            
+            if (!uid) return; // No UID means it's a sample
+            
+            // Open high-res modal for generated previews
+            openHighResModal(uid, styleName);
+        });
+    });
+}
+
 
 // Modal close handling
 document.addEventListener('DOMContentLoaded', function () {
@@ -709,6 +796,11 @@ document.addEventListener('DOMContentLoaded', function () {
     if (closeBtn) {
         closeBtn.addEventListener('click', function () {
             modal.style.display = 'none';
+            // Show download button again when closing
+            const modalDownload = document.getElementById('modal-download');
+            if (modalDownload) {
+                modalDownload.style.display = 'inline-block';
+            }
         });
     }
     // Close modal when clicking outside content
@@ -716,7 +808,313 @@ document.addEventListener('DOMContentLoaded', function () {
         modal.addEventListener('click', function (e) {
             if (e.target === modal) {
                 modal.style.display = 'none';
+                // Show download button again when closing
+                const modalDownload = document.getElementById('modal-download');
+                if (modalDownload) {
+                    modalDownload.style.display = 'inline-block';
+                }
             }
         });
     }
+    
+    // Setup sample preview functionality
+    setupSamplePreviews();
+    
+    // Setup high-resolution modal functionality
+    setupHighResModal();
+    
+    // Load usage statistics on page load
+    loadUsageStats();
 });
+
+// Load and display usage statistics
+function loadUsageStats() {
+    fetch('/get_stats')
+        .then(response => response.json())
+        .then(data => {
+            updateCounter(data.images_processed || 0);
+        })
+        .catch(error => {
+            console.log('Could not load usage stats:', error);
+            updateCounter(0);
+        });
+}
+
+// Update the counter display
+function updateCounter(count) {
+    const counterText = document.getElementById('counter-text');
+    if (counterText) {
+        const plural = count === 1 ? 'anvilization' : 'anvilizations';
+        counterText.textContent = `Total all time: ${count} ${plural}`;
+    }
+}
+
+// High-Resolution Modal Functions
+function openHighResModal(uid, style) {
+    const modal = document.getElementById('highres-modal');
+    if (!modal) return;
+    
+    // Store current processing info
+    modal.dataset.uid = uid;
+    modal.dataset.style = style;
+    
+    // Reset format selection to PNG
+    const pngRadio = modal.querySelector('input[name="format"][value="png"]');
+    if (pngRadio) pngRadio.checked = true;
+    
+    // Show modal
+    modal.style.display = 'flex';
+    
+    // Update button state after modal is shown and format is selected
+    setTimeout(function() {
+        const startBtn = document.getElementById('start-highres');
+        const selectedFormat = modal.querySelector('input[name="format"]:checked');
+        if (startBtn) {
+            if (selectedFormat) {
+                startBtn.classList.add('enabled');
+                startBtn.disabled = false;
+                startBtn.style.opacity = '1';
+                startBtn.style.pointerEvents = 'auto';
+            } else {
+                startBtn.classList.remove('enabled');
+                startBtn.disabled = true;
+                startBtn.style.opacity = '0.5';
+                startBtn.style.pointerEvents = 'none';
+            }
+        }
+    }, 50);
+}
+
+function setupHighResModal() {
+    const modal = document.getElementById('highres-modal');
+    const closeBtn = document.getElementById('close-highres-modal');
+    const cancelBtn = document.getElementById('cancel-highres');
+    const startBtn = document.getElementById('start-highres');
+    
+    // Close button handlers
+    if (closeBtn) {
+        closeBtn.addEventListener('click', function() {
+            modal.style.display = 'none';
+        });
+    }
+    
+    if (cancelBtn) {
+        cancelBtn.addEventListener('click', function() {
+            modal.style.display = 'none';
+        });
+    }
+    
+    // Close when clicking outside
+    if (modal) {
+        modal.addEventListener('click', function(e) {
+            if (e.target === modal) {
+                modal.style.display = 'none';
+            }
+        });
+    }
+    
+    // Function to update Start Processing button state
+    function updateStartButton() {
+        const selectedFormat = modal.querySelector('input[name="format"]:checked');
+        if (startBtn) {
+            if (selectedFormat) {
+                startBtn.classList.add('enabled');
+                startBtn.disabled = false;
+                startBtn.style.opacity = '1';
+                startBtn.style.pointerEvents = 'auto';
+            } else {
+                startBtn.classList.remove('enabled');
+                startBtn.disabled = true;
+                startBtn.style.opacity = '0.5';
+                startBtn.style.pointerEvents = 'none';
+            }
+        }
+    }
+    
+    // Handle radio button selection styling manually (CSP-safe)
+    const formatOptions = modal.querySelectorAll('.format-option');
+    formatOptions.forEach(function(option) {
+        const radio = option.querySelector('input[type="radio"]');
+        if (radio) {
+            radio.addEventListener('change', function() {
+                // Reset all options
+                formatOptions.forEach(function(opt) {
+                    opt.style.borderColor = '#e0e0e0';
+                    opt.style.backgroundColor = 'transparent';
+                });
+                
+                // Style the selected option
+                if (this.checked) {
+                    option.style.borderColor = '#0070F2';
+                    option.style.backgroundColor = '#f8f9ff';
+                }
+                
+                // Update button state when format selection changes
+                updateStartButton();
+            });
+        }
+    });
+    
+    // Start processing button
+    if (startBtn) {
+        startBtn.addEventListener('click', function() {
+            const uid = modal.dataset.uid;
+            const style = modal.dataset.style;
+            const selectedFormat = modal.querySelector('input[name="format"]:checked');
+            
+            if (!uid || !style || !selectedFormat) {
+                alert('Missing processing information. Please try again.');
+                return;
+            }
+            
+            const format = selectedFormat.value;
+            
+            // Close modal and start processing
+            modal.style.display = 'none';
+            startHighResProcessing(uid, style, format);
+        });
+    }
+}
+
+function startHighResProcessing(uid, style, format) {
+    // Ensure DOM is fully loaded before accessing elements
+    if (document.readyState !== 'complete') {
+        console.warn('DOM not fully loaded, waiting...');
+        window.addEventListener('load', function() {
+            startHighResProcessing(uid, style, format);
+        });
+        return;
+    }
+    
+    // Show full-screen high-resolution loading overlay
+    const highresOverlay = document.getElementById('highres-loading-overlay');
+    
+    if (!highresOverlay) {
+        console.error('High-res loading overlay element not found');
+        console.error('Available elements:', document.querySelectorAll('[id*="loading"]'));
+        alert('Error: Loading overlay not found. Please refresh the page and try again.');
+        return;
+    }
+    
+    const loadingText = highresOverlay.querySelector('.loading-text');
+    const subText = highresOverlay.querySelector('.loading-subtext');
+    const statusText = highresOverlay.querySelector('.processing-status-text');
+    
+    // Add null checks for child elements
+    if (!loadingText || !subText || !statusText) {
+        console.error('Loading overlay child elements not found');
+        alert('Error: Loading interface elements not found. Please refresh the page and try again.');
+        return;
+    }
+    
+    // Update loading messages based on format
+    if (format === 'png') {
+        loadingText.textContent = 'Processing 8K PNG Image...';
+        subText.textContent = 'This may take 30-60 seconds for high-resolution processing';
+        statusText.textContent = 'Enhancing your image to 8K resolution...';
+    } else {
+        loadingText.textContent = 'Creating Layer Package...';
+        subText.textContent = 'This may take 1-2 minutes for complete layer separation';
+        statusText.textContent = 'Generating editable layers for professional use...';
+    }
+    
+    // Show the overlay
+    highresOverlay.style.display = 'flex';
+    
+    // Disable modal closing during processing
+    const modal = document.getElementById('highres-modal');
+    if (modal) {
+        const closeButtons = modal.querySelectorAll('.close-modal, #cancel-highres');
+        closeButtons.forEach(btn => {
+            btn.style.pointerEvents = 'none';
+            btn.style.opacity = '0.5';
+        });
+    }
+    
+    // Update status text every 15 seconds to keep user engaged
+    const statusMessages = [
+        format === 'png' ? 'Analyzing image structure...' : 'Extracting background layer...',
+        format === 'png' ? 'Applying high-resolution enhancements...' : 'Isolating subject elements...',
+        format === 'png' ? 'Optimizing image quality...' : 'Creating anvil overlay layer...',
+        format === 'png' ? 'Finalizing 8K image...' : 'Packaging layers for download...'
+    ];
+    
+    let statusIndex = 0;
+    const statusInterval = setInterval(() => {
+        if (statusIndex < statusMessages.length) {
+            statusText.textContent = statusMessages[statusIndex];
+            statusIndex++;
+        }
+    }, 15000);
+    
+    // Start the processing request
+    fetch(`/process_highres/${uid}/${style}/${format}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+    })
+    .then(response => {
+        if (!response.ok) {
+            return response.json().then(err => Promise.reject(err));
+        }
+        return response.blob();
+    })
+    .then(blob => {
+        // Processing successful - trigger download
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        
+        // Generate filename
+        const extIndex = uploadFilename.lastIndexOf('.');
+        const baseName = extIndex >= 0 ? uploadFilename.slice(0, extIndex) : uploadFilename;
+        const colourName = (selectedColour || '').replace('#', '');
+        const slugStyle = style.toLowerCase().replace(/\s+/g, '');
+        
+        if (format === 'png') {
+            a.download = `${baseName}_${slugStyle}_${colourName}_8K.png`;
+        } else {
+            a.download = `${baseName}_${slugStyle}_${colourName}_layers.zip`;
+        }
+        
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        // Hide high-resolution loading overlay
+        clearInterval(statusInterval);
+        highresOverlay.style.display = 'none';
+        
+        // Re-enable modal buttons
+        if (modal) {
+            const closeButtons = modal.querySelectorAll('.close-modal, #cancel-highres');
+            closeButtons.forEach(btn => {
+                btn.style.pointerEvents = 'auto';
+                btn.style.opacity = '1';
+            });
+        }
+    })
+    .catch(error => {
+        console.error('High-res processing error:', error);
+        
+        // Hide loading overlay
+        clearInterval(statusInterval);
+        highresOverlay.style.display = 'none';
+        
+        // Re-enable modal buttons
+        if (modal) {
+            const closeButtons = modal.querySelectorAll('.close-modal, #cancel-highres');
+            closeButtons.forEach(btn => {
+                btn.style.pointerEvents = 'auto';
+                btn.style.opacity = '1';
+            });
+        }
+        
+        // Show error details if available
+        if (error && error.error) {
+            alert('High-resolution processing failed: ' + error.error);
+        } else {
+            alert('High-resolution processing failed. Please try again.');
+        }
+    });
+}

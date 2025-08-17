@@ -2,7 +2,7 @@
 Flask application implementing the SAP Anvil Tool.
 
 This web application lets a user upload an image, crop it to a fixed
-aspect ratio via a browser‑side Cropper.js component, and then
+aspect ratio via a custom browser-side crop interface, and then
 generates a set of brand‑compliant anvil overlays in various styles
 (flat, stroke, gradient, window, silhouette).  The processed
 previews are shown in a grid with one‑click downloads for the full
@@ -71,9 +71,20 @@ except Exception as e:
 # Initialise Flask app
 app = Flask(__name__)
 
+# Configure CSP with more permissive policy to handle browser extensions
+@app.after_request
+def set_csp_header(response):
+    # More permissive CSP that allows browser extensions while maintaining security
+    response.headers['Content-Security-Policy'] = "script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self';"
+    return response
+
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / 'generated'
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+# Create logs directory for image logging
+LOGS_DIR = BASE_DIR / 'logs'
+LOGS_DIR.mkdir(exist_ok=True)
 
 # Colour palette according to SAP specification (or your new one)
 COLOR_PALETTE: Dict[str, str] = {
@@ -197,53 +208,48 @@ def decode_image(data_url: str) -> Image.Image:
 def upscale_image_if_needed(img: Image.Image, ratio: str) -> Image.Image:
     """Upscale the image using high-quality Pillow resizing if it's smaller than the target size.
 
-    Memory-optimized version with conservative upscaling limits.
+    True high-resolution version supporting up to 8K output.
 
     Args:
         img: Cropped PIL Image in RGBA mode.
         ratio: Either '16:9' or '1:1'.
 
     Returns:
-        Upscaled PIL Image.
+        Upscaled PIL Image (original size preserved for high-quality processing).
     """
-    # Conservative target sizes to manage memory usage
+    # True high-resolution target sizes - preserve original image dimensions
     if ratio == '16:9':
-        target_w, target_h = 1920, 1080
-        max_w, max_h = 1920, 1080  # Cap at Full HD
+        target_w, target_h = 7680, 4320  # 8K UHD
+        max_w, max_h = 7680, 4320
     else:  # 1:1
-        target_w, target_h = 1080, 1080  # Reduced from 1920x1920
-        max_w, max_h = 1080, 1080  # Cap at 1080x1080 for squares
+        target_w, target_h = 7680, 7680  # 8K square
+        max_w, max_h = 7680, 7680
 
     w, h = img.size
-    print(f"Original image size: {w}x{h}, Target: {target_w}x{target_h}")
+    print(f"Original image size: {w}x{h}, Max target: {target_w}x{target_h}")
 
-    # Only upscale if image is significantly smaller (less than 75% of target)
-    min_threshold_w = int(target_w * 0.75)
-    min_threshold_h = int(target_h * 0.75)
-    
-    if w >= min_threshold_w and h >= min_threshold_h:
-        print("Image size adequate, no upscaling needed")
+    # For high-resolution processing, preserve original image dimensions
+    # Only apply size limits for extremely large images that exceed 8K
+    if w <= max_w and h <= max_h:
+        print("Image within 8K limits, preserving original dimensions")
         return img
 
-    # Calculate conservative scaling factor
-    scale_w = min(target_w / w, max_w / w)
-    scale_h = min(target_h / h, max_h / h)
-    scale = min(scale_w, scale_h, 2.0)  # Cap scaling at 2x to prevent excessive memory usage
-
-    # Only proceed if scaling is reasonable
-    if scale <= 1.0:
-        return img
-
-    print(f"Upscaling by factor {scale:.2f}")
-    new_size = (int(w * scale), int(h * scale))
+    # Only downscale if image exceeds 8K limits
+    if w > max_w or h > max_h:
+        scale_w = max_w / w if w > max_w else 1.0
+        scale_h = max_h / h if h > max_h else 1.0
+        scale = min(scale_w, scale_h)
+        
+        new_size = (int(w * scale), int(h * scale))
+        print(f"Downscaling oversized image by factor {scale:.2f} to {new_size}")
+        
+        # Use high-quality resampling for downscaling
+        return img.resize(new_size, Image.LANCZOS)
     
-    # Use more memory-efficient resampling for large images
-    if w * h > 1000000:  # > 1MP
-        resampling = Image.BILINEAR  # Less memory intensive
-    else:
-        resampling = Image.LANCZOS   # High quality for smaller images
-    
-    return img.resize(new_size, resampling)
+    # For smaller images, preserve original size rather than upscaling
+    # This maintains quality and allows users to get their original resolution
+    print("Preserving original image size for high-quality output")
+    return img
 
 
 def compute_anvil_dimensions(canvas_w: int, canvas_h: int) -> Tuple[int, int]:
@@ -532,19 +538,10 @@ def generate_styles_sequential(cropped_img: Image.Image, ratio: str, chosen_colo
     # Upscale if needed
     upscaled = upscale_image_if_needed(img, ratio)
     
-    # Use conservative target sizes
-    if ratio == '16:9':
-        target_w, target_h = 1920, 1080
-    else:  # 1:1
-        target_w, target_h = 1080, 1080
-
+    # Use original image dimensions for true high-resolution processing
     orig_w, orig_h = upscaled.size
-    if orig_w >= target_w and orig_h >= target_h:
-        size = (orig_w, orig_h)
-        img_resized = upscaled.resize(size, Image.LANCZOS) if upscaled.size != size else upscaled
-    else:
-        size = (target_w, target_h)
-        img_resized = upscaled.resize(size, Image.LANCZOS)
+    size = (orig_w, orig_h)
+    img_resized = upscaled if upscaled.size == size else upscaled.resize(size, Image.LANCZOS)
     
     # Save base image to disk and clear from memory
     base_path = session_dir / 'base_temp.png'
@@ -732,6 +729,13 @@ def save_images(images: Dict[str, Image.Image], uid: str, orig_filename: str, co
     return paths
 
 
+@app.route('/get_stats')
+def get_stats() -> Any:
+    """Get usage statistics including total images processed."""
+    count = get_image_count()
+    return jsonify({'images_processed': count})
+
+
 @app.route('/')
 def index() -> Any:
     """Serve the main page."""
@@ -745,7 +749,8 @@ def process() -> Any:
     """Handle the cropped image and generate previews.
 
     Expects JSON with keys:
-        * imageData: Data URL of the cropped image.
+        * imageData: Data URL of the cropped image (preview resolution).
+        * highResData: Data URL of the cropped image (high resolution).
         * ratio: '16:9' or '1:1'.
         * colour: Colour hex string.
 
@@ -753,7 +758,8 @@ def process() -> Any:
         JSON containing preview data and download identifiers.
     """
     data = request.get_json(force=True)
-    image_data = data.get('imageData')
+    image_data = data.get('imageData')  # Preview resolution
+    highres_data = data.get('highResData')  # High resolution
     ratio = data.get('ratio', '16:9')
     colour = data.get('colour', COLOR_PALETTE.get('Blue 2', '#0070F2')) # Default to new palette default
     # Opacity for silhouette style (0..1)
@@ -764,10 +770,21 @@ def process() -> Any:
     anvil_scale = data.get('anvilScale', 0.7)
     anvil_offset_x = data.get('anvilOffsetX', 0.0)
     anvil_offset_y = data.get('anvilOffsetY', 0.0)
+    
     if not image_data:
         return jsonify({'error': 'No image data provided'}), 400
+    if not highres_data:
+        return jsonify({'error': 'No high-resolution data provided'}), 400
+        
     try:
+        # Decode PREVIEW image for fast preview generation
         cropped_img = decode_image(image_data)
+        print(f"Preview image decoded: {cropped_img.size}")
+        
+        # Decode HIGH-RES image for storage
+        highres_img = decode_image(highres_data)
+        print(f"High-res image decoded: {highres_img.size}")
+        
     except Exception as e:
         print(f"Error decoding image: {e}")
         return jsonify({'error': 'Failed to decode image data'}), 400
@@ -797,8 +814,40 @@ def process() -> Any:
     print(f"Processing image: Ratio={ratio}, Color={colour}, Scale={scale_val}, OffsetX={offset_x_val}, OffsetY={offset_y_val}")
     
     try:
+        # Clean up all generated files before processing new images
+        cleanup_generated_files()
+        
         # Generate unique ID for this session
         uid = uuid.uuid4().hex
+        session_dir = OUTPUT_DIR / uid
+        session_dir.mkdir(exist_ok=True)
+        
+        # Save log version of the original image
+        save_log_image(highres_img, uid)
+        
+        # Store HIGH-RESOLUTION image for later high-res processing  
+        # Use the actual high-res data sent from JavaScript, not the preview
+        highres_original = highres_img.copy()
+        
+        # Check if high-res image exceeds 8K and resize if necessary
+        max_width, max_height = 7680, 4320  # 8K resolution
+        if highres_original.width > max_width or highres_original.height > max_height:
+            # Calculate scaling factor to fit within 8K while maintaining aspect ratio
+            scale_w = max_width / highres_original.width
+            scale_h = max_height / highres_original.height
+            scale = min(scale_w, scale_h)
+            
+            new_size = (int(highres_original.width * scale), int(highres_original.height * scale))
+            highres_original = highres_original.resize(new_size, Image.LANCZOS)
+            print(f"Auto-resized high-res from {highres_img.size} to {new_size} for 8K compliance")
+        
+        # Save TRUE high-resolution image for later use
+        original_highres_path = session_dir / 'original_highres.png'
+        highres_original.save(original_highres_path, format='PNG')
+        print(f"Stored TRUE high-res image: {highres_original.size}")
+        
+        # Add size logging for comparison
+        print(f"Size comparison - Preview: {cropped_img.size}, High-res: {highres_original.size}")
         
         # Use sequential generation to minimize memory usage
         style_paths = generate_styles_sequential(
@@ -806,8 +855,7 @@ def process() -> Any:
             anvil_scale=scale_val, anvil_offset_x=offset_x_val, anvil_offset_y=offset_y_val
         )
         
-        # Save metadata for downloads
-        session_dir = OUTPUT_DIR / uid
+        # Save metadata for downloads including high-res processing parameters
         colour_name: Optional[str] = None
         for name, hex_val in COLOR_PALETTE.items():
             if hex_val.lower() == colour.lower():
@@ -820,7 +868,14 @@ def process() -> Any:
         
         meta = {
             'base_name': base_name,
-            'colour_slug': colour_slug
+            'colour_slug': colour_slug,
+            'colour_hex': colour,
+            'opacity': opacity_val,
+            'anvil_scale': scale_val,
+            'anvil_offset_x': offset_x_val,
+            'anvil_offset_y': offset_y_val,
+            'ratio': ratio,
+            'original_size': f"{highres_original.width}x{highres_original.height}"
         }
         with open(session_dir / 'meta.json', 'w', encoding='utf-8') as f:
             json.dump(meta, f)
@@ -916,6 +971,230 @@ def download_all(uid: str) -> Any:
                 zf.write(file, arcname=arc_name)
     return send_file(str(zip_path), mimetype='application/zip', as_attachment=True,
                      download_name='anvil_assets.zip')
+
+
+@app.route('/process_highres/<uid>/<style>/<format>', methods=['POST'])
+def process_high_resolution(uid: str, style: str, format: str) -> Any:
+    """Process a single style at high resolution (up to 8K).
+    
+    Args:
+        uid: Session identifier
+        style: Style name (e.g., 'Window', 'Silhouette')
+        format: Output format ('png' or 'layers')
+    
+    Returns:
+        High-resolution PNG or layer package ZIP
+    """
+    if format not in ['png', 'layers']:
+        return jsonify({'error': 'Invalid format. Use "png" or "layers"'}), 400
+    
+    session_dir = OUTPUT_DIR / uid
+    if not session_dir.exists():
+        return jsonify({'error': 'Session not found'}), 404
+    
+    # Load session metadata
+    meta_path = session_dir / 'meta.json'
+    if not meta_path.exists():
+        return jsonify({'error': 'Session metadata not found'}), 404
+    
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta_data = json.load(f)
+    except Exception as e:
+        return jsonify({'error': f'Failed to load session metadata: {e}'}), 500
+    
+    # Load original image data (we'll need to store this during initial processing)
+    original_img_path = session_dir / 'original_highres.png'
+    if not original_img_path.exists():
+        return jsonify({'error': 'Original high-res image not found. Please re-upload your image.'}), 404
+    
+    try:
+        # Load the original high-resolution image
+        original_img = Image.open(original_img_path).convert('RGBA')
+        print(f"Processing high-res {style} style at {original_img.size}")
+        
+        # Apply size validation and auto-resize if needed (max 8K)
+        max_width, max_height = 7680, 4320  # 8K resolution
+        if original_img.width > max_width or original_img.height > max_height:
+            # Calculate scaling factor to fit within 8K while maintaining aspect ratio
+            scale_w = max_width / original_img.width
+            scale_h = max_height / original_img.height
+            scale = min(scale_w, scale_h)
+            
+            new_size = (int(original_img.width * scale), int(original_img.height * scale))
+            original_img = original_img.resize(new_size, Image.LANCZOS)
+            print(f"Auto-resized to {new_size} to fit within 8K limits")
+        
+        # Load processing parameters from metadata
+        colour_hex = meta_data.get('colour_hex', '#0070F2')
+        opacity = meta_data.get('opacity', 0.5)
+        anvil_scale = meta_data.get('anvil_scale', 0.7)
+        anvil_offset_x = meta_data.get('anvil_offset_x', 0.0)
+        anvil_offset_y = meta_data.get('anvil_offset_y', 0.0)
+        base_name = meta_data.get('base_name', 'image')
+        colour_slug = meta_data.get('colour_slug', 'Custom')
+        
+        # Convert hex to RGB
+        hex_colour = colour_hex.lstrip('#')
+        fill_colour = tuple(int(hex_colour[i:i+2], 16) for i in (0, 2, 4))
+        
+        # Compute anvil coordinates at high resolution
+        size = original_img.size
+        coords = compute_anvil_coords(size, anvil_scale, anvil_offset_x, anvil_offset_y)
+        
+        # Process the specific style at high resolution using original dimensions
+        if style == 'Window':
+            result_img = apply_window_style(original_img, size, fill_colour, coords=coords)
+        elif style == 'Silhouette':
+            result_img = apply_silhouette_style(original_img, size, fill_colour, opacity, coords=coords)
+        elif style == 'Flat':
+            # Use original image directly without resizing
+            result_img = original_img.convert('RGBA')
+            overlay = Image.new('RGBA', size, (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            alpha_val = int(max(0.0, min(1.0, opacity)) * 255)
+            draw.polygon(list(coords), fill=fill_colour + (alpha_val,))
+            result_img.alpha_composite(overlay)
+        elif style == 'Stroke':
+            # Use original image directly without resizing
+            result_img = original_img.convert('RGBA')
+            stroke_layer = draw_stroke_outline(size, fill_colour, coords=coords)
+            result_img.alpha_composite(stroke_layer)
+            # Add subject cutout if available
+            if _has_rembg:
+                arr = remove_background_human(np.array(original_img.convert('RGB')))
+                if arr is not None:
+                    subject_img = Image.fromarray(arr).convert('RGBA')
+                    result_img.alpha_composite(subject_img)
+        elif style == 'Gradient':
+            # Use original image directly without resizing
+            result_img = original_img.convert('RGBA')
+            grad_stops = get_gradient_stops(colour_hex)
+            gradient_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
+            result_img.alpha_composite(gradient_overlay)
+        elif style == 'Gradient Silhouette':
+            result_img = apply_silhouette_style(original_img, size, fill_colour, opacity, coords=coords)
+            # Replace flat overlay with gradient - use original image directly
+            base_img = original_img.convert('RGBA')
+            grad_stops = get_gradient_stops(colour_hex)
+            gradient_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
+            base_img.alpha_composite(gradient_overlay)
+            # Add subject cutout
+            if _has_rembg:
+                arr = remove_background_human(np.array(original_img.convert('RGB')))
+                if arr is not None:
+                    subject_img = Image.fromarray(arr).convert('RGBA')
+                    base_img.alpha_composite(subject_img)
+            result_img = base_img
+        else:
+            return jsonify({'error': f'Unknown style: {style}'}), 400
+        
+        # Return based on requested format
+        if format == 'png':
+            # Return high-resolution PNG
+            img_buffer = io.BytesIO()
+            result_img.save(img_buffer, format='PNG')
+            img_buffer.seek(0)
+            
+            download_name = f"{base_name}_{style.lower()}_{colour_slug}_8K.png"
+            return send_file(img_buffer, mimetype='image/png', as_attachment=True,
+                           download_name=download_name)
+        
+        elif format == 'layers':
+            # Create layer package
+            from layer_package_generator import create_layer_package, get_layer_components_from_style
+            
+            # Extract layer components
+            background, subject_cutout, anvil_overlay = get_layer_components_from_style(
+                original_img, style, fill_colour, coords, opacity
+            )
+            
+            # Create layer package ZIP
+            resolution_str = f"{size[0]}x{size[1]}"
+            zip_bytes = create_layer_package(
+                background, subject_cutout, anvil_overlay, result_img,
+                style, colour_slug, colour_hex, base_name, resolution_str
+            )
+            
+            zip_buffer = io.BytesIO(zip_bytes)
+            download_name = f"{base_name}_{style.lower()}_{colour_slug}_layers.zip"
+            
+            return send_file(zip_buffer, mimetype='application/zip', as_attachment=True,
+                           download_name=download_name)
+    
+    except Exception as e:
+        print(f"Error in high-res processing: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': f'High-resolution processing failed: {str(e)}'}), 500
+
+
+def save_log_image(image: Image.Image, uid: str) -> None:
+    """Save a small log version of the original image (800px max on longest side).
+    
+    Args:
+        image: PIL Image to save as log
+        uid: Unique session identifier for filename
+    """
+    try:
+        # Calculate scaling to fit 800px on longest side
+        w, h = image.size
+        max_size = 800
+        
+        if max(w, h) <= max_size:
+            # Image is already small enough
+            log_img = image.copy()
+        else:
+            # Scale down maintaining aspect ratio
+            if w > h:
+                new_w = max_size
+                new_h = int(h * (max_size / w))
+            else:
+                new_h = max_size
+                new_w = int(w * (max_size / h))
+            
+            log_img = image.resize((new_w, new_h), Image.LANCZOS)
+        
+        # Generate filename with timestamp and UID
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{timestamp}_{uid}.jpg"
+        log_path = LOGS_DIR / filename
+        
+        # Save as JPEG for smaller file size
+        log_img.convert('RGB').save(log_path, format='JPEG', quality=85)
+        print(f"Saved log image: {filename} ({log_img.size})")
+        
+    except Exception as e:
+        print(f"Warning: Could not save log image: {e}")
+
+
+def cleanup_generated_files() -> None:
+    """Clean up all generated files before processing new images."""
+    try:
+        import shutil
+        if OUTPUT_DIR.exists():
+            # Remove all session directories
+            for session_dir in OUTPUT_DIR.iterdir():
+                if session_dir.is_dir():
+                    shutil.rmtree(session_dir, ignore_errors=True)
+            print("Cleaned up all generated files")
+    except Exception as e:
+        print(f"Error during generated files cleanup: {e}")
+
+
+def get_image_count() -> int:
+    """Get the total number of processed images by counting log files."""
+    try:
+        if not LOGS_DIR.exists():
+            return 0
+        
+        # Count only .jpg files in logs directory
+        log_files = [f for f in LOGS_DIR.iterdir() if f.suffix.lower() == '.jpg']
+        return len(log_files)
+    except Exception as e:
+        print(f"Error counting log files: {e}")
+        return 0
 
 
 def cleanup_old_sessions(max_sessions: int = 20) -> None:
