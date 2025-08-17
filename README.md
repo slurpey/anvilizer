@@ -2,7 +2,7 @@
 
 A Flask-based web application that transforms uploaded images into SAP brand-compliant anvil-styled graphics. Upload any image, crop it to your desired aspect ratio, and generate professional anvil overlays in multiple styles with high-resolution output up to 8K.
 
-![Anvilizer Preview](static/images/previews/sample_gradient.png)
+![Anvilizer Preview](static/images/previews/sample_gradient_silhouette.png)
 
 ## Features
 
