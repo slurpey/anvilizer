@@ -504,7 +504,13 @@ body {
     color: #0070F2;
     font-size: 1.8rem;
 }
-.loading-container { text-align: center; }
+.loading-container { 
+    text-align: center; 
+    background-color: rgba(0, 0, 0, 0.9);
+    border-radius: 8px;
+    padding: 30px;
+    max-width: 400px;
+}
 .spinner {
     border: 6px solid #f3f3f3;
     border-top: 6px solid #0070F2;
@@ -544,6 +550,14 @@ body {
     font-size: 1rem;
     margin-top: 12px;
     font-weight: 500;
+}
+
+.cpu-humor-text {
+    color: #999;
+    font-size: 0.85rem;
+    margin-top: 15px;
+    font-style: italic;
+    opacity: 0.8;
 }
 
 /* High-Resolution Modal Styles */

@@ -544,6 +544,9 @@ generateBtn.addEventListener('click', function () {
     // Show loading overlay while processing
     if (loadingOverlay) {
         loadingOverlay.style.display = 'flex';
+        
+        // Start rotating status messages for the standard loading screen
+        startStatusRotation();
     }
     fetch('/process', {
         method: 'POST',
@@ -572,6 +575,7 @@ generateBtn.addEventListener('click', function () {
             // Hide loading overlay after previews rendered
             if (loadingOverlay) {
                 loadingOverlay.style.display = 'none';
+                stopStatusRotation();
             }
         })
         .catch(err => {
@@ -973,6 +977,44 @@ function setupHighResModal() {
             modal.style.display = 'none';
             startHighResProcessing(uid, style, format);
         });
+    }
+}
+
+// Status rotation for standard loading screen
+let statusRotationInterval = null;
+
+function startStatusRotation() {
+    const statusMessages = [
+        '🔍 Analyzing your masterpiece...',
+        '🎨 Extracting subjects and backgrounds...',
+        '⚒️ Forging anvil shapes with precision...',
+        '🌈 Applying SAP brand colors...',
+        '✨ Generating 6 stunning styles...',
+        '🚀 Almost ready for download...'
+    ];
+    
+    const statusElement = loadingOverlay ? loadingOverlay.querySelector('.processing-status-text') : null;
+    if (!statusElement) return;
+    
+    let currentIndex = 0;
+    statusElement.textContent = statusMessages[0];
+    
+    // Clear any existing interval
+    if (statusRotationInterval) {
+        clearInterval(statusRotationInterval);
+    }
+    
+    // Start rotating messages every 12 seconds
+    statusRotationInterval = setInterval(() => {
+        currentIndex = (currentIndex + 1) % statusMessages.length;
+        statusElement.textContent = statusMessages[currentIndex];
+    }, 12000);
+}
+
+function stopStatusRotation() {
+    if (statusRotationInterval) {
+        clearInterval(statusRotationInterval);
+        statusRotationInterval = null;
     }
 }
 

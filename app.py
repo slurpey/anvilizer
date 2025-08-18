@@ -83,7 +83,11 @@ OUTPUT_DIR = BASE_DIR / 'generated'
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Create logs directory for image logging
-LOGS_DIR = BASE_DIR / 'logs'
+# Use /logs for Kubernetes persistent volume, fallback to local logs/ for development
+if os.path.exists('/logs'):
+    LOGS_DIR = Path('/logs')
+else:
+    LOGS_DIR = BASE_DIR / 'logs'
 LOGS_DIR.mkdir(exist_ok=True)
 
 # Colour palette according to SAP specification (or your new one)

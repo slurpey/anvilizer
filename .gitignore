@@ -47,5 +47,23 @@ Thumbs.db
 *.tmp
 *.temp
 
-# SAP/KYMA deployment files (local only)
+# Security & Privacy: Keep deployment configs local
 SAP/
+DEPLOYMENT_GUIDE.md
+kubeconfig*.yaml
+*.kubeconfig
+
+# Docker & Container files (keep local for security)
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Environment & Security files
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.cert
+secrets/
+config/production/
