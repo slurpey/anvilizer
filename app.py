@@ -87,60 +87,38 @@ app = Flask(__name__)
 limiter = create_limiter(app)
 
 # --- Queue System ---
-class ProcessingJob:
-    def __init__(self, job_id, route, params):
-        self.job_id = job_id
-        self.route = route  # 'preview' or 'highres'
-        self.params = params
-        self.status = "queued"
-        self.result = None
+from queue_processor import get_processor, initialize_processor
 
-queue_lock = threading.Lock()
-processing_queue = deque()  # List of ProcessingJob objects
-active_job_id = None  # Currently running job
+# Initialize the queue processor with 2 worker threads
+processor = initialize_processor(num_workers=2, result_ttl=3600)
 
-# Global lock dictionary for per-session concurrency control
+# Job processors will be registered after they are defined
+
+# Global lock dictionary for per-session concurrency control (still needed for file operations)
 session_locks = {}  # uid: threading.Lock
-
-def add_job_to_queue(route, params):
-    job_id = uuid.uuid4().hex
-    job = ProcessingJob(job_id, route, params)
-    with queue_lock:
-        processing_queue.append(job)
-    return job_id
-
-def get_job_position(job_id):
-    with queue_lock:
-        for idx, job in enumerate(processing_queue):
-            if job.job_id == job_id:
-                return idx + (1 if active_job_id != job_id else 0)
-    return -1
-
-def set_active_job(job_id):
-    global active_job_id
-    with queue_lock:
-        active_job_id = job_id
-
-def remove_job(job_id):
-    global active_job_id, processing_queue
-    with queue_lock:
-        # copy to a list first to avoid iterator issues, then rebuild deque
-        processing_queue = deque([job for job in list(processing_queue) if job.job_id != job_id])
-        if active_job_id == job_id:
-            active_job_id = None
-
-def job_status(job_id):
-    with queue_lock:
-        for job in processing_queue:
-            if job.job_id == job_id:
-                return job.status
-    return "not_found"
 
 @app.route("/queue_status/<job_id>")
 def queue_status(job_id):
-    pos = get_job_position(job_id)
-    status = job_status(job_id)
-    return jsonify({"position": pos, "status": status})
+    """Get the status of a queued job."""
+    job_status = processor.get_job_status(job_id)
+    if not job_status:
+        return jsonify({"status": "not_found"}), 404
+    
+    # Map backend status to frontend expected status
+    backend_status = job_status['status']
+    if backend_status == 'completed':
+        frontend_status = 'done'
+    elif backend_status == 'failed':
+        frontend_status = 'error'  
+    else:
+        frontend_status = backend_status  # 'queued', 'processing'
+    
+    return jsonify({
+        "position": job_status.get('position', -1),
+        "status": frontend_status,
+        "job_id": job_id,
+        "result": job_status.get('result')
+    })
 
 # Configure secure CSP header
 @app.after_request
@@ -991,94 +969,115 @@ def index() -> Any:
     return render_template('index.html', colours=COLOR_PALETTE, default_color=default_color)
 
 
+def process_preview_job(params):
+    """
+    Process a preview generation job. This function is called by the queue worker.
+    
+    Args:
+        params: Dictionary containing job parameters
+        
+    Returns:
+        Dictionary with processing results
+    """
+    data = params.get('request_data', {})
+    uid = uuid.uuid4().hex
+    
+    # Use a per-session lock for concurrency protection
+    if uid not in session_locks:
+        session_locks[uid] = threading.Lock()
+    lock = session_locks[uid]
+    
+    with lock:
+        # Secure validation of image data
+        preview_data_url = data.get('imageData')
+        if not preview_data_url:
+            log_security_event("Missing image data", params.get('remote_addr', 'unknown'))
+            raise ValueError("Missing preview image data")
+        
+        # Validate and decode image securely
+        try:
+            cropped_img = validate_image_data(preview_data_url)
+        except ValueError as e:
+            log_security_event(f"Invalid image data: {str(e)}", params.get('remote_addr', 'unknown'))
+            raise ValueError(f"Invalid image data: {str(e)}")
+
+        # Validate and sanitize input parameters
+        ratio = data.get('ratio', '16:9')
+        if ratio not in ['16:9', '1:1']:
+            log_security_event(f"Invalid ratio: {ratio}", params.get('remote_addr', 'unknown'))
+            raise ValueError("Invalid aspect ratio")
+        
+        colour = data.get('colour', '#0070F2')
+        if not validate_color_hex(colour):
+            log_security_event(f"Invalid color: {colour}", params.get('remote_addr', 'unknown'))
+            raise ValueError("Invalid color format")
+        
+        # Validate numeric parameters
+        try:
+            opacity = validate_numeric_parameter(data.get('opacity', 0.5), 'opacity', 0.0, 1.0, 0.5)
+            anvilScale = validate_numeric_parameter(data.get('anvilScale', 0.7), 'anvilScale', 0.1, 1.0, 0.7)
+            anvilOffsetX = validate_numeric_parameter(data.get('anvilOffsetX', 0.0), 'anvilOffsetX', -1.0, 1.0, 0.0)
+            anvilOffsetY = validate_numeric_parameter(data.get('anvilOffsetY', 0.0), 'anvilOffsetY', -1.0, 1.0, 0.0)
+        except ValueError as e:
+            log_security_event(f"Invalid numeric parameter: {str(e)}", params.get('remote_addr', 'unknown'))
+            raise ValueError(str(e))
+        
+        # Validate filename
+        filename = data.get('filename') or "image"
+        try:
+            filename = validate_filename(filename)
+        except ValueError as e:
+            log_security_event(f"Invalid filename: {str(e)}", params.get('remote_addr', 'unknown'))
+            raise ValueError(str(e))
+
+        # Generate previews for all styles, save to disk, return as base64 for speed
+        style_paths = generate_styles_sequential(
+            cropped_img=cropped_img,
+            ratio=ratio,
+            chosen_colour_hex=colour,
+            uid=uid,
+            opacity=opacity,
+            anvil_scale=anvilScale,
+            anvil_offset_x=anvilOffsetX,
+            anvil_offset_y=anvilOffsetY
+        )
+
+        # Convert previews to base64 strings for grid presentation
+        previews = {}
+        for style, path in style_paths.items():
+            with open(path, "rb") as imgf:
+                previews[style] = base64.b64encode(imgf.read()).decode('utf-8')
+
+        # Save log image for statistics/troubleshooting
+        save_log_image(cropped_img, uid)
+
+    return {'uid': uid, 'previews': previews}
+
+
 @app.route('/process', methods=['POST'])
 @limiter.limit(UPLOAD_RATE_LIMIT)
 def process() -> Any:
-    """Queue-protected: Handle image and generate previews with security validation."""
-
-    data = request.get_json(force=True)
-    job_id = add_job_to_queue("preview", data)
-    pos = get_job_position(job_id)
-    if pos > 1:
-        return jsonify({"status": "queued", "position": pos, "job_id": job_id}), 202
-
-    set_active_job(job_id)
-
+    """Submit image processing job to the queue."""
     try:
-        uid = uuid.uuid4().hex
-        # Use a per-session lock for concurrency protection
-        if uid not in session_locks:
-            session_locks[uid] = threading.Lock()
-        lock = session_locks[uid]
-        with lock:
-            # Secure validation of image data
-            preview_data_url = data.get('imageData')
-            if not preview_data_url:
-                log_security_event("Missing image data", request.remote_addr)
-                return handle_validation_error("Missing preview image data")
-            
-            # Validate and decode image securely
-            try:
-                cropped_img = validate_image_data(preview_data_url)
-            except ValueError as e:
-                log_security_event(f"Invalid image data: {str(e)}", request.remote_addr)
-                return handle_validation_error(f"Invalid image data: {str(e)}")
-
-            # Validate and sanitize input parameters
-            ratio = data.get('ratio', '16:9')
-            if ratio not in ['16:9', '1:1']:
-                log_security_event(f"Invalid ratio: {ratio}", request.remote_addr)
-                return handle_validation_error("Invalid aspect ratio")
-            
-            colour = data.get('colour', '#0070F2')
-            if not validate_color_hex(colour):
-                log_security_event(f"Invalid color: {colour}", request.remote_addr)
-                return handle_validation_error("Invalid color format")
-            
-            # Validate numeric parameters
-            try:
-                opacity = validate_numeric_parameter(data.get('opacity', 0.5), 'opacity', 0.0, 1.0, 0.5)
-                anvilScale = validate_numeric_parameter(data.get('anvilScale', 0.7), 'anvilScale', 0.1, 1.0, 0.7)
-                anvilOffsetX = validate_numeric_parameter(data.get('anvilOffsetX', 0.0), 'anvilOffsetX', -1.0, 1.0, 0.0)
-                anvilOffsetY = validate_numeric_parameter(data.get('anvilOffsetY', 0.0), 'anvilOffsetY', -1.0, 1.0, 0.0)
-            except ValueError as e:
-                log_security_event(f"Invalid numeric parameter: {str(e)}", request.remote_addr)
-                return handle_validation_error(str(e))
-            
-            # Validate filename
-            filename = data.get('filename') or "image"
-            try:
-                filename = validate_filename(filename)
-            except ValueError as e:
-                log_security_event(f"Invalid filename: {str(e)}", request.remote_addr)
-                return handle_validation_error(str(e))
-
-            # Generate previews for all styles, save to disk, return as base64 for speed
-            style_paths = generate_styles_sequential(
-                cropped_img=cropped_img,
-                ratio=ratio,
-                chosen_colour_hex=colour,
-                uid=uid,
-                opacity=opacity,
-                anvil_scale=anvilScale,
-                anvil_offset_x=anvilOffsetX,
-                anvil_offset_y=anvilOffsetY
-            )
-
-            # Convert previews to base64 strings for grid presentation
-            previews = {}
-            for style, path in style_paths.items():
-                with open(path, "rb") as imgf:
-                    previews[style] = base64.b64encode(imgf.read()).decode('utf-8')
-
-            # Save log image for statistics/troubleshooting
-            save_log_image(cropped_img, uid)
-
-        remove_job(job_id)
-        return jsonify({'status': 'done', 'uid': uid, 'previews': previews})
+        data = request.get_json(force=True)
+        
+        # Submit job to queue processor
+        job_id = processor.submit_job('preview', {
+            'request_data': data,
+            'remote_addr': request.remote_addr
+        })
+        
+        # Always return job ID for polling
+        return jsonify({
+            "status": "queued",
+            "job_id": job_id
+        }), 202
+        
     except Exception as e:
-        remove_job(job_id)
-        return jsonify({'status': 'error', 'error': str(e), 'job_id': job_id}), 500
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
 
 
 @app.route('/download/<uid>/<style_name>')
@@ -1162,16 +1161,53 @@ def download_all(uid: str) -> Any:
 
 
 @app.route('/process_highres/<uid>/<style>/<format>', methods=['POST'])
+@limiter.limit(UPLOAD_RATE_LIMIT)
 def process_high_resolution(uid: str, style: str, format: str) -> Any:
     """Queue-protected: High-res image processing with optional high-resolution image data."""
+    try:
+        # Validate parameters
+        uid = validate_uid(uid)
+        style = validate_style_name(style)
+        if format not in ['png', 'layers']:
+            raise ValueError("Invalid format")
+        
+        # Submit high-res job to queue processor
+        job_params = {
+            "uid": uid, 
+            "style": style, 
+            "format": format,
+            "request_data": request.get_json() or {},
+            "remote_addr": request.remote_addr
+        }
+        job_id = processor.submit_job('highres', job_params)
+        
+        return jsonify({
+            "status": "queued", 
+            "job_id": job_id
+        }), 202
+        
+    except Exception as e:
+        log_security_event(f"High-res processing error: {str(e)}", request.remote_addr)
+        return jsonify({
+            "status": "error", 
+            "error": str(e)
+        }), 500
 
-    params = {"uid": uid, "style": style, "format": format}
-    job_id = add_job_to_queue("highres", params)
-    pos = get_job_position(job_id)
-    if pos > 1:
-        return jsonify({"status": "queued", "position": pos, "job_id": job_id}), 202
 
-    set_active_job(job_id)
+def process_highres_job(params):
+    """
+    Process a high-resolution generation job. This function is called by the queue worker.
+    
+    Args:
+        params: Dictionary containing job parameters
+        
+    Returns:
+        Dictionary with processing results or file data
+    """
+    uid = params.get('uid')
+    style = params.get('style')
+    format = params.get('format')
+    request_data = params.get('request_data', {})
 
     try:
         # Use per-session lock to guard concurrent high-res processing
@@ -1184,7 +1220,6 @@ def process_high_resolution(uid: str, style: str, format: str) -> Any:
                 raise FileNotFoundError("Session not found")
 
             # Parse request data to check for high-resolution image data
-            request_data = request.get_json() or {}
             high_res_data = request_data.get('highResImageData')
             
             if high_res_data and high_res_data.startswith('data:image'):
@@ -1228,14 +1263,13 @@ def process_high_resolution(uid: str, style: str, format: str) -> Any:
             if format == "png":
                 # Send high-resolution image directly
                 with open(style_img_path, "rb") as f:
-                    data = f.read()
-                remove_job(job_id)
-                return send_file(
-                    io.BytesIO(data),
-                    mimetype='image/png',
-                    as_attachment=True,
-                    download_name=f"{uid}_{style}_8K.png"
-                )
+                    result_data = f.read()
+                return {
+                    'status': 'completed',
+                    'file_data': result_data,
+                    'mimetype': 'image/png',
+                    'filename': f"{uid}_{style}_8K.png"
+                }
             elif format == "layers":
                 # For layer package, assemble ZIP with base, subject, anvil, composite
                 zip_buffer = io.BytesIO()
@@ -1262,13 +1296,12 @@ def process_high_resolution(uid: str, style: str, format: str) -> Any:
                         missing_files.append("final_composite.png")
 
                     if missing_files:
-                        remove_job(job_id)
                         error_msg = (
                             f"Missing required files for high-res layer download: {', '.join(missing_files)}.\n"
                             "This session may have expired or preview processing did not complete correctly.\n"
                             "Please re-run the preview generation step and try again."
                         )
-                        return jsonify({'status': 'error', 'error': error_msg, 'job_id': job_id}), 500
+                        raise FileNotFoundError(error_msg)
 
                     # Write existing files to zip
                     zf.write(base_path, "01_background.png")
@@ -1296,21 +1329,19 @@ def process_high_resolution(uid: str, style: str, format: str) -> Any:
                     )
                     zf.writestr("README.txt", readme_content.encode('utf-8'))
                 zip_buffer.seek(0)
-                remove_job(job_id)
-                return send_file(
-                    zip_buffer,
-                    mimetype='application/zip',
-                    as_attachment=True,
-                    download_name=f"{uid}_{style}_layers.zip"
-                )
+                result_data = zip_buffer.getvalue()
+                return {
+                    'status': 'completed',
+                    'file_data': result_data,
+                    'mimetype': 'application/zip',
+                    'filename': f"{uid}_{style}_layers.zip"
+                }
             else:
-                remove_job(job_id)
-                return jsonify({'status': 'error', 'error': 'Unknown format', 'job_id': job_id}), 400
-
+                raise ValueError('Unknown format')
+        
         # lock is released here
     except Exception as e:
-        remove_job(job_id)
-        return jsonify({'status': 'error', 'error': str(e), 'job_id': job_id}), 500
+        raise Exception(f'High-res processing failed: {str(e)}')
 
 
 def save_log_image(image: Image.Image, uid: str) -> None:
@@ -1531,24 +1562,17 @@ def admin_sessions_api():
 @require_admin_auth
 def admin_queue_api():
     """Admin API for queue status with security protection."""
-    # Exposes the current memory queue, active job id, processed images, pod_name
-    with queue_lock:
-        queue_list = [
-            {
-                "job_id": job.job_id,
-                "route": job.route,
-                "params": job.params,
-                "status": job.status
-            }
-            for job in processing_queue
-        ]
-        active = active_job_id
+    # Get queue status from the new processor
+    queue_stats = processor.get_stats()
     
     return jsonify({
-        "queue": queue_list,
-        "active_job_id": active,
+        "queue": queue_stats.get('pending_jobs', []),
+        "active_job_id": queue_stats.get('active_job_id'),
         "images_processed": get_image_count(),
-        "pod_name": socket.gethostname()
+        "pod_name": socket.gethostname(),
+        "total_jobs": queue_stats.get('total_jobs', 0),
+        "completed_jobs": queue_stats.get('completed_jobs', 0),
+        "failed_jobs": queue_stats.get('failed_jobs', 0)
     })
 
 @app.route("/admin/api/session/<uid>/delete", methods=["POST"])
@@ -1621,6 +1645,10 @@ def admin_session_thumb(uid, style):
     except Exception:
         return "Error", 500
 
+
+# Register job processors after they are defined
+processor.register_processor('preview', process_preview_job)
+processor.register_processor('highres', process_highres_job)
 
 if __name__ == '__main__':
     # Clean up old sessions on startup (24-hour retention)

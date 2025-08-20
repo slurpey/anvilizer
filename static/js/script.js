@@ -192,6 +192,16 @@ document.querySelectorAll('.colour-swatch').forEach(function (swatch) {
     });
 });
 
+// Auto-select "Blue 2" (#0070F2) as default color on page load
+document.addEventListener('DOMContentLoaded', function() {
+    const blue2Swatch = document.querySelector('.colour-swatch[data-colour="#0070F2"]');
+    if (blue2Swatch) {
+        blue2Swatch.classList.add('selected');
+        selectedColour = '#0070F2';
+        updateGenerateButton();
+    }
+});
+
 // Dragging the crop box
 cropBox.addEventListener('mousedown', function (e) {
     isDragging = true;
@@ -592,38 +602,101 @@ generateBtn.addEventListener('click', function () {
         });
 
 function pollQueueStatus(jobId, routeType) {
+    const POLLING_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
+    const POLLING_INTERVAL = 2000; // 2 seconds
+    const startTime = Date.now();
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 3;
+    
     let pollingInterval = setInterval(() => {
+        // Check for timeout
+        if (Date.now() - startTime > POLLING_TIMEOUT) {
+            clearInterval(pollingInterval);
+            console.error('Queue polling timeout after 5 minutes');
+            
+            if (loadingOverlay) {
+                loadingOverlay.style.display = 'none';
+                stopStatusRotation();
+            }
+            
+            alert('Processing is taking longer than expected. Please try refreshing the page or try again later.');
+            return;
+        }
+        
         fetch(`/queue_status/${jobId}`)
-            .then(resp => resp.json())
+            .then(resp => {
+                if (!resp.ok) {
+                    throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+                }
+                return resp.json();
+            })
             .then(qdata => {
+                // Reset error counter on successful response
+                consecutiveErrors = 0;
+                
                 // Update UI with queue info
                 if (loadingOverlay) {
                     let textElem = loadingOverlay.querySelector('.processing-status-text');
                     if (textElem) {
-                        if (qdata.position && qdata.position > 1)
+                        if (qdata.position && qdata.position > 1) {
                             textElem.textContent = `In queue: You are #${qdata.position} for processing`;
-                        else
+                        } else {
                             textElem.textContent = 'Processing started...';
+                        }
                     }
                 }
+                
                 if (qdata.status === "done") {
                     clearInterval(pollingInterval);
-                    // Optionally, trigger a page reload or refresh the preview grid
-                    // For now, simply reload for new result
-                    window.location.reload();
+                    
+                    // Handle completed job result
+                    if (qdata.result && routeType === 'process') {
+                        // Preview generation completed
+                        renderPreviews(qdata.result.uid, qdata.result.previews);
+                        loadUsageStats();
+                        if (loadingOverlay) {
+                            loadingOverlay.style.display = 'none';
+                            stopStatusRotation();
+                        }
+                    } else {
+                        // Fallback to page reload if no result data
+                        if (loadingOverlay) {
+                            loadingOverlay.style.display = 'none';
+                            stopStatusRotation();
+                        }
+                        window.location.reload();
+                    }
                 }
-                if (qdata.status === "error" || qdata.status === "not_found") {
+                else if (qdata.status === "error" || qdata.status === "not_found") {
                     clearInterval(pollingInterval);
+                    console.error('Job processing failed:', qdata);
+                    
+                    if (loadingOverlay) {
+                        loadingOverlay.style.display = 'none';
+                        stopStatusRotation();
+                    }
+                    
                     alert('Image processing failed, please try again.');
-                    if (loadingOverlay) loadingOverlay.style.display = 'none';
                 }
             })
-            .catch(() => {
-                clearInterval(pollingInterval);
-                alert('Queue polling failed. Please refresh.');
-                if (loadingOverlay) loadingOverlay.style.display = 'none';
+            .catch(error => {
+                consecutiveErrors++;
+                console.error(`Queue polling error (attempt ${consecutiveErrors}):`, error);
+                
+                // Stop polling after too many consecutive errors
+                if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+                    clearInterval(pollingInterval);
+                    
+                    if (loadingOverlay) {
+                        loadingOverlay.style.display = 'none';
+                        stopStatusRotation();
+                    }
+                    
+                    alert('Connection issues detected. Please check your internet connection and try again.');
+                }
+                // Otherwise continue polling - temporary network issues might resolve
             });
-    }, 2000);
+    }, POLLING_INTERVAL);
 }
 });
 
