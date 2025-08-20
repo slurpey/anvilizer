@@ -40,6 +40,9 @@ import io
 import os
 import uuid
 import gc
+import threading
+import time
+from collections import deque
 from pathlib import Path
 import json
 from typing import Dict, Tuple, List, Optional, Any
@@ -71,6 +74,62 @@ except Exception as e:
 # Initialise Flask app
 app = Flask(__name__)
 
+# --- Queue System ---
+class ProcessingJob:
+    def __init__(self, job_id, route, params):
+        self.job_id = job_id
+        self.route = route  # 'preview' or 'highres'
+        self.params = params
+        self.status = "queued"
+        self.result = None
+
+queue_lock = threading.Lock()
+processing_queue = deque()  # List of ProcessingJob objects
+active_job_id = None  # Currently running job
+
+# Global lock dictionary for per-session concurrency control
+session_locks = {}  # uid: threading.Lock
+
+def add_job_to_queue(route, params):
+    job_id = uuid.uuid4().hex
+    job = ProcessingJob(job_id, route, params)
+    with queue_lock:
+        processing_queue.append(job)
+    return job_id
+
+def get_job_position(job_id):
+    with queue_lock:
+        for idx, job in enumerate(processing_queue):
+            if job.job_id == job_id:
+                return idx + (1 if active_job_id != job_id else 0)
+    return -1
+
+def set_active_job(job_id):
+    global active_job_id
+    with queue_lock:
+        active_job_id = job_id
+
+def remove_job(job_id):
+    global active_job_id, processing_queue
+    with queue_lock:
+        # copy to a list first to avoid iterator issues, then rebuild deque
+        processing_queue = deque([job for job in list(processing_queue) if job.job_id != job_id])
+        if active_job_id == job_id:
+            active_job_id = None
+
+def job_status(job_id):
+    with queue_lock:
+        for job in processing_queue:
+            if job.job_id == job_id:
+                return job.status
+    return "not_found"
+
+@app.route("/queue_status/<job_id>")
+def queue_status(job_id):
+    pos = get_job_position(job_id)
+    status = job_status(job_id)
+    return jsonify({"position": pos, "status": status})
+
 # Configure CSP with more permissive policy to handle browser extensions
 @app.after_request
 def set_csp_header(response):
@@ -79,16 +138,20 @@ def set_csp_header(response):
     return response
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / 'generated'
-OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Create logs directory for image logging
-# Use /logs for Kubernetes persistent volume, fallback to local logs/ for development
+# Prefer PVC-backed /logs for both log images and generated output when available.
+# This ensures generated files are written to the cluster persistent volume
+# (mounted at /logs) instead of the container's ephemeral filesystem.
 if os.path.exists('/logs'):
     LOGS_DIR = Path('/logs')
+    OUTPUT_DIR = LOGS_DIR / 'generated'
 else:
     LOGS_DIR = BASE_DIR / 'logs'
-LOGS_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR = BASE_DIR / 'generated'
+
+# Ensure directories exist
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Colour palette according to SAP specification (or your new one)
 COLOR_PALETTE: Dict[str, str] = {
@@ -523,6 +586,176 @@ def apply_silhouette_style(img: Image.Image, size: Tuple[int, int], fill_colour:
     return composite
 
 
+def generate_single_style_highres(cropped_img: Image.Image, style: str, ratio: str, chosen_colour_hex: str, uid: str, opacity: float = 0.5, anvil_scale: float = 0.7, anvil_offset_x: float = 0.0, anvil_offset_y: float = 0.0) -> Dict[str, str]:
+    """Generate a single style at high resolution for advanced processing.
+
+    This function processes only the requested style with the high-resolution image data,
+    saving high-res base and subject files with appropriate naming for layer packages.
+
+    Args:
+        cropped_img: High-resolution PIL Image (RGBA).
+        style: Style name to generate ('Flat', 'Stroke', etc.).
+        ratio: Aspect ratio ('16:9' or '1:1').
+        chosen_colour_hex: Hex color code.
+        uid: Unique session identifier.
+        opacity: Opacity for color overlays (0.0-1.0).
+        anvil_scale: Scale of anvil relative to canvas (0.0-1.0).
+        anvil_offset_x: Horizontal offset (-1.0 to 1.0).
+        anvil_offset_y: Vertical offset (-1.0 to 1.0).
+
+    Returns:
+        Dictionary mapping style name to file path.
+    """
+    # Create session directory
+    session_dir = OUTPUT_DIR / uid
+    session_dir.mkdir(exist_ok=True)
+    
+    # Ensure we have RGBA
+    img = cropped_img.convert('RGBA')
+    print(f"Starting high-res processing for {img.size} image, style: {style}")
+    
+    # Upscale if needed (preserves original dimensions for high-res)
+    upscaled = upscale_image_if_needed(img, ratio)
+    
+    # Use original image dimensions for true high-resolution processing
+    size = upscaled.size
+    img_resized = upscaled if upscaled.size == size else upscaled.resize(size, Image.LANCZOS)
+    
+    # Save high-res base image to disk
+    base_path = session_dir / f'highres_base_{style}.png'
+    img_resized.save(base_path, format='PNG')
+    print(f"High-res base image saved: {base_path}")
+    
+    # Convert chosen colour hex to RGB tuple
+    hex_colour = chosen_colour_hex.lstrip('#')
+    fill_colour = tuple(int(hex_colour[i:i+2], 16) for i in (0, 2, 4))
+    
+    # Compute anvil coordinates
+    coords = compute_anvil_coords(size, anvil_scale, anvil_offset_x, anvil_offset_y)
+    
+    # Extract subject cutout and save high-res version
+    subject_cutout_path = session_dir / f'highres_subject_{style}.png'
+    if _has_rembg:
+        print("Extracting high-res subject using rembg...")
+        arr = remove_background_human(np.array(img_resized.convert('RGB')))
+        if arr is not None:
+            subject_cutout = Image.fromarray(arr).convert('RGBA')
+            subject_cutout.save(subject_cutout_path, format='PNG')
+            print("High-res subject extraction successful")
+        else:
+            print("High-res subject extraction failed, using fallback")
+            img_resized.convert('RGBA').save(subject_cutout_path, format='PNG')
+    else:
+        # Fallback: use base image as subject
+        img_resized.save(subject_cutout_path, format='PNG')
+    
+    print(f"High-res subject cutout saved: {subject_cutout_path}")
+    
+    # Create standalone anvil shape layer for layer packages
+    anvil_shape_path = session_dir / f'highres_anvil_{style}.png'
+    anvil_shape_img = Image.new('RGBA', size, (0, 0, 0, 0))
+    
+    if style == 'Flat':
+        draw_anvil = ImageDraw.Draw(anvil_shape_img)
+        flat_alpha = int(max(0.0, min(1.0, opacity)) * 255)
+        draw_anvil.polygon(list(coords), fill=fill_colour + (flat_alpha,))
+    elif style == 'Stroke':
+        stroke_layer = draw_stroke_outline(size, fill_colour, coords=coords)
+        anvil_shape_img.alpha_composite(stroke_layer)
+    elif style == 'Gradient':
+        grad_stops = get_gradient_stops(chosen_colour_hex)
+        gradient_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
+        anvil_shape_img.alpha_composite(gradient_overlay)
+    elif style == 'Window':
+        # For window style, create a mask that shows the anvil area
+        mask = create_anvil_mask(size, invert=True, coords=coords)
+        bg = Image.new('RGBA', size, fill_colour + (255,))
+        anvil_shape_img = Image.composite(bg, Image.new('RGBA', size, (0, 0, 0, 0)), mask)
+    elif style == 'Silhouette':
+        draw_anvil = ImageDraw.Draw(anvil_shape_img)
+        alpha_val = int(max(0.0, min(1.0, opacity)) * 255)
+        draw_anvil.polygon(list(coords), fill=fill_colour + (alpha_val,))
+    elif style == 'Gradient Silhouette':
+        grad_stops = get_gradient_stops(chosen_colour_hex)
+        grad_sil_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
+        anvil_shape_img.alpha_composite(grad_sil_overlay)
+    
+    anvil_shape_img.save(anvil_shape_path, format='PNG')
+    print(f"High-res anvil shape saved: {anvil_shape_path}")
+    
+    # Generate the requested style
+    print(f"Generating high-res {style} style...")
+    
+    if style == 'Flat':
+        base_img = Image.open(base_path).convert('RGBA')
+        flat_overlay = Image.new('RGBA', size, (0, 0, 0, 0))
+        draw_flat = ImageDraw.Draw(flat_overlay)
+        flat_alpha = int(max(0.0, min(1.0, opacity)) * 255)
+        draw_flat.polygon(list(coords), fill=fill_colour + (flat_alpha,))
+        base_img.alpha_composite(flat_overlay)
+        style_path = session_dir / f'highres_{style}.png'
+        base_img.save(style_path, format='PNG')
+        del base_img, flat_overlay
+        
+    elif style == 'Stroke':
+        base_img = Image.open(base_path).convert('RGBA')
+        subject_img = Image.open(subject_cutout_path).convert('RGBA')
+        stroke_layer = draw_stroke_outline(size, fill_colour, coords=coords)
+        base_img.alpha_composite(stroke_layer)
+        base_img.alpha_composite(subject_img)
+        style_path = session_dir / f'highres_{style}.png'
+        base_img.save(style_path, format='PNG')
+        del base_img, subject_img, stroke_layer
+        
+    elif style == 'Gradient':
+        base_img = Image.open(base_path).convert('RGBA')
+        grad_stops = get_gradient_stops(chosen_colour_hex)
+        gradient_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
+        base_img.alpha_composite(gradient_overlay)
+        style_path = session_dir / f'highres_{style}.png'
+        base_img.save(style_path, format='PNG')
+        del base_img, gradient_overlay
+        
+    elif style == 'Window':
+        base_img = Image.open(base_path).convert('RGBA')
+        window_img = apply_window_style(base_img, size, fill_colour, coords=coords)
+        style_path = session_dir / f'highres_{style}.png'
+        window_img.save(style_path, format='PNG')
+        del base_img, window_img
+        
+    elif style == 'Silhouette':
+        base_img = Image.open(base_path).convert('RGBA')
+        subject_img = Image.open(subject_cutout_path).convert('RGBA')
+        overlay = Image.new('RGBA', size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        alpha_val = int(max(0.0, min(1.0, opacity)) * 255)
+        draw.polygon(list(coords), fill=fill_colour + (alpha_val,))
+        base_img.alpha_composite(overlay)
+        base_img.alpha_composite(subject_img)
+        style_path = session_dir / f'highres_{style}.png'
+        base_img.save(style_path, format='PNG')
+        del base_img, subject_img, overlay
+        
+    elif style == 'Gradient Silhouette':
+        base_img = Image.open(base_path).convert('RGBA')
+        subject_img = Image.open(subject_cutout_path).convert('RGBA')
+        grad_stops = get_gradient_stops(chosen_colour_hex)
+        grad_sil_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
+        base_img.alpha_composite(grad_sil_overlay)
+        base_img.alpha_composite(subject_img)
+        style_path = session_dir / f'highres_{style}.png'
+        base_img.save(style_path, format='PNG')
+        del base_img, subject_img, grad_sil_overlay
+        
+    else:
+        raise ValueError(f"Unknown style: {style}")
+    
+    gc.collect()
+    print(f"High-res {style} style generation completed: {style_path}")
+    
+    return {style: str(style_path)}
+
+
 def generate_styles_sequential(cropped_img: Image.Image, ratio: str, chosen_colour_hex: str, uid: str, opacity: float = 0.5, anvil_scale: float = 0.7, anvil_offset_x: float = 0.0, anvil_offset_y: float = 0.0) -> Dict[str, str]:
     """Generate all required styles sequentially with disk buffering to minimize memory usage.
 
@@ -569,9 +802,9 @@ def generate_styles_sequential(cropped_img: Image.Image, ratio: str, chosen_colo
         base_img = Image.open(base_path).convert('RGB')
         arr = remove_background_human(np.array(base_img))
         if arr is not None:
-            subject_cutout = Image.fromarray(arr).convert('RGBA')
-            subject_cutout.save(subject_cutout_path, format='PNG')
-            print("Subject extraction successful, saved to disk")
+                subject_cutout = Image.fromarray(arr).convert('RGBA')
+                subject_cutout.save(subject_cutout_path, format='PNG')
+                print("Subject extraction successful, saved to disk")
         else:
             print("Subject extraction failed, using fallback")
             base_img.convert('RGBA').save(subject_cutout_path, format='PNG')
@@ -668,13 +901,6 @@ def generate_styles_sequential(cropped_img: Image.Image, ratio: str, chosen_colo
     del base_img, subject_img, grad_sil_overlay
     gc.collect()
     
-    # Clean up temporary files
-    try:
-        base_path.unlink()
-        subject_cutout_path.unlink()
-    except Exception as e:
-        print(f"Warning: Could not clean up temp files: {e}")
-    
     print("Sequential style generation completed successfully")
     return style_paths
 
@@ -750,167 +976,64 @@ def index() -> Any:
 
 @app.route('/process', methods=['POST'])
 def process() -> Any:
-    """Handle the cropped image and generate previews.
+    """Queue-protected: Handle image and generate previews."""
 
-    Expects JSON with keys:
-        * imageData: Data URL of the cropped image (preview resolution).
-        * highResData: Data URL of the cropped image (high resolution).
-        * ratio: '16:9' or '1:1'.
-        * colour: Colour hex string.
-
-    Returns:
-        JSON containing preview data and download identifiers.
-    """
     data = request.get_json(force=True)
-    image_data = data.get('imageData')  # Preview resolution
-    highres_data = data.get('highResData')  # High resolution
-    ratio = data.get('ratio', '16:9')
-    colour = data.get('colour', COLOR_PALETTE.get('Blue 2', '#0070F2')) # Default to new palette default
-    # Opacity for silhouette style (0..1)
-    opacity = data.get('opacity', 0.5)
-    # Original filename
-    orig_filename = data.get('filename', 'image')
-    # Anvil customisation parameters
-    anvil_scale = data.get('anvilScale', 0.7)
-    anvil_offset_x = data.get('anvilOffsetX', 0.0)
-    anvil_offset_y = data.get('anvilOffsetY', 0.0)
-    
-    if not image_data:
-        return jsonify({'error': 'No image data provided'}), 400
-    if not highres_data:
-        return jsonify({'error': 'No high-resolution data provided'}), 400
-        
+    job_id = add_job_to_queue("preview", data)
+    pos = get_job_position(job_id)
+    if pos > 1:
+        return jsonify({"status": "queued", "position": pos, "job_id": job_id}), 202
+
+    set_active_job(job_id)
+
     try:
-        # Decode PREVIEW image for fast preview generation
-        cropped_img = decode_image(image_data)
-        print(f"Preview image decoded: {cropped_img.size}")
-        
-        # Decode HIGH-RES image for storage
-        highres_img = decode_image(highres_data)
-        print(f"High-res image decoded: {highres_img.size}")
-        
-    except Exception as e:
-        print(f"Error decoding image: {e}")
-        return jsonify({'error': 'Failed to decode image data'}), 400
-    # Generate styles
-    try:
-        opacity_val = float(opacity)
-    except Exception:
-        opacity_val = 0.5
-    opacity_val = max(0.0, min(1.0, opacity_val))
-    # Parse anvil customisation values
-    try:
-        scale_val = float(anvil_scale)
-    except Exception:
-        scale_val = 0.7
-    try:
-        offset_x_val = float(anvil_offset_x)
-    except Exception:
-        offset_x_val = 0.0
-    try:
-        offset_y_val = float(anvil_offset_y)
-    except Exception:
-        offset_y_val = 0.0
-    # Clamp values
-    scale_val = max(0.2, min(scale_val, 1.0))
-    offset_x_val = max(-1.0, min(offset_x_val, 1.0))
-    offset_y_val = max(-1.0, min(offset_y_val, 1.0))
-    print(f"Processing image: Ratio={ratio}, Color={colour}, Scale={scale_val}, OffsetX={offset_x_val}, OffsetY={offset_y_val}")
-    
-    try:
-        # Clean up all generated files before processing new images
-        cleanup_generated_files()
-        
-        # Generate unique ID for this session
         uid = uuid.uuid4().hex
-        session_dir = OUTPUT_DIR / uid
-        session_dir.mkdir(exist_ok=True)
-        
-        # Save log version of the original image
-        save_log_image(highres_img, uid)
-        
-        # Store HIGH-RESOLUTION image for later high-res processing  
-        # Use the actual high-res data sent from JavaScript, not the preview
-        highres_original = highres_img.copy()
-        
-        # Check if high-res image exceeds 8K and resize if necessary
-        max_width, max_height = 7680, 4320  # 8K resolution
-        if highres_original.width > max_width or highres_original.height > max_height:
-            # Calculate scaling factor to fit within 8K while maintaining aspect ratio
-            scale_w = max_width / highres_original.width
-            scale_h = max_height / highres_original.height
-            scale = min(scale_w, scale_h)
-            
-            new_size = (int(highres_original.width * scale), int(highres_original.height * scale))
-            highres_original = highres_original.resize(new_size, Image.LANCZOS)
-            print(f"Auto-resized high-res from {highres_img.size} to {new_size} for 8K compliance")
-        
-        # Save TRUE high-resolution image for later use
-        original_highres_path = session_dir / 'original_highres.png'
-        highres_original.save(original_highres_path, format='PNG')
-        print(f"Stored TRUE high-res image: {highres_original.size}")
-        
-        # Add size logging for comparison
-        print(f"Size comparison - Preview: {cropped_img.size}, High-res: {highres_original.size}")
-        
-        # Use sequential generation to minimize memory usage
-        style_paths = generate_styles_sequential(
-            cropped_img, ratio, colour, uid, opacity=opacity_val,
-            anvil_scale=scale_val, anvil_offset_x=offset_x_val, anvil_offset_y=offset_y_val
-        )
-        
-        # Save metadata for downloads including high-res processing parameters
-        colour_name: Optional[str] = None
-        for name, hex_val in COLOR_PALETTE.items():
-            if hex_val.lower() == colour.lower():
-                colour_name = name
-                break
-        if colour_name is None:
-            colour_name = 'Custom'
-        colour_slug = colour_name.replace(' ', '')
-        base_name = Path(orig_filename).stem or 'image'
-        
-        meta = {
-            'base_name': base_name,
-            'colour_slug': colour_slug,
-            'colour_hex': colour,
-            'opacity': opacity_val,
-            'anvil_scale': scale_val,
-            'anvil_offset_x': offset_x_val,
-            'anvil_offset_y': offset_y_val,
-            'ratio': ratio,
-            'original_size': f"{highres_original.width}x{highres_original.height}"
-        }
-        with open(session_dir / 'meta.json', 'w', encoding='utf-8') as f:
-            json.dump(meta, f)
-        
-        # Create previews from saved files (memory-efficient)
-        previews = {}
-        for style, file_path in style_paths.items():
-            # Load image temporarily for preview
-            img = Image.open(file_path).convert('RGBA')
-            img.thumbnail((400, 1400))  # Smaller previews to save memory
-            buffered = io.BytesIO()
-            img.save(buffered, format='PNG')
-            preview_b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-            previews[style] = preview_b64
-            
-            # Clean up immediately
-            del img, buffered
-            gc.collect()
-        
-        # Final cleanup
-        del cropped_img
-        gc.collect()
-        
-        print("Sequential image processing completed successfully")
-        return jsonify({'uid': uid, 'previews': previews})
-        
+        # Use a per-session lock for concurrency protection
+        if uid not in session_locks:
+            session_locks[uid] = threading.Lock()
+        lock = session_locks[uid]
+        with lock:
+            # Decode preview (moderate resolution) image sent by frontend cropper
+            preview_data_url = data.get('imageData')
+            if not preview_data_url:
+                raise ValueError("Missing preview image data")
+            cropped_img = decode_image(preview_data_url)
+
+            # Frontend sends all crop/anvil params
+            ratio = data.get('ratio', '16:9')
+            colour = data.get('colour', '#0070F2')
+            opacity = float(data.get('opacity', 0.5))
+            anvilScale = float(data.get('anvilScale', 0.7))
+            anvilOffsetX = float(data.get('anvilOffsetX', 0.0))
+            anvilOffsetY = float(data.get('anvilOffsetY', 0.0))
+            filename = data.get('filename') or "image"
+
+            # Generate previews for all styles, save to disk, return as base64 for speed
+            style_paths = generate_styles_sequential(
+                cropped_img=cropped_img,
+                ratio=ratio,
+                chosen_colour_hex=colour,
+                uid=uid,
+                opacity=opacity,
+                anvil_scale=anvilScale,
+                anvil_offset_x=anvilOffsetX,
+                anvil_offset_y=anvilOffsetY
+            )
+
+            # Convert previews to base64 strings for grid presentation
+            previews = {}
+            for style, path in style_paths.items():
+                with open(path, "rb") as imgf:
+                    previews[style] = base64.b64encode(imgf.read()).decode('utf-8')
+
+            # Save log image for statistics/troubleshooting
+            save_log_image(cropped_img, uid)
+
+        remove_job(job_id)
+        return jsonify({'status': 'done', 'uid': uid, 'previews': previews})
     except Exception as e:
-        print(f"Error during image processing: {e}")
-        # Clean up on error
-        gc.collect()
-        return jsonify({'error': f'Image processing failed: {str(e)}. Try with a smaller image.'}), 500
+        remove_job(job_id)
+        return jsonify({'status': 'error', 'error': str(e), 'job_id': job_id}), 500
 
 
 @app.route('/download/<uid>/<style_name>')
@@ -979,158 +1102,154 @@ def download_all(uid: str) -> Any:
 
 @app.route('/process_highres/<uid>/<style>/<format>', methods=['POST'])
 def process_high_resolution(uid: str, style: str, format: str) -> Any:
-    """Process a single style at high resolution (up to 8K).
-    
-    Args:
-        uid: Session identifier
-        style: Style name (e.g., 'Window', 'Silhouette')
-        format: Output format ('png' or 'layers')
-    
-    Returns:
-        High-resolution PNG or layer package ZIP
-    """
-    if format not in ['png', 'layers']:
-        return jsonify({'error': 'Invalid format. Use "png" or "layers"'}), 400
-    
-    session_dir = OUTPUT_DIR / uid
-    if not session_dir.exists():
-        return jsonify({'error': 'Session not found'}), 404
-    
-    # Load session metadata
-    meta_path = session_dir / 'meta.json'
-    if not meta_path.exists():
-        return jsonify({'error': 'Session metadata not found'}), 404
-    
+    """Queue-protected: High-res image processing with optional high-resolution image data."""
+
+    params = {"uid": uid, "style": style, "format": format}
+    job_id = add_job_to_queue("highres", params)
+    pos = get_job_position(job_id)
+    if pos > 1:
+        return jsonify({"status": "queued", "position": pos, "job_id": job_id}), 202
+
+    set_active_job(job_id)
+
     try:
-        with open(meta_path, 'r', encoding='utf-8') as f:
-            meta_data = json.load(f)
+        # Use per-session lock to guard concurrent high-res processing
+        if uid not in session_locks:
+            session_locks[uid] = threading.Lock()
+        lock = session_locks[uid]
+        with lock:
+            session_dir = OUTPUT_DIR / uid
+            if not session_dir.exists():
+                raise FileNotFoundError("Session not found")
+
+            # Parse request data to check for high-resolution image data
+            request_data = request.get_json() or {}
+            high_res_data = request_data.get('highResImageData')
+            
+            if high_res_data and high_res_data.startswith('data:image'):
+                print("High-resolution image data provided, processing from original image...")
+                
+                # Decode high-resolution image
+                cropped_img = decode_image(high_res_data)
+                
+                # Get processing parameters from request
+                ratio = request_data.get('ratio', '16:9')
+                colour = request_data.get('colour', '#0070F2')
+                opacity = float(request_data.get('opacity', 0.5))
+                anvil_scale = float(request_data.get('anvilScale', 0.7))
+                anvil_offset_x = float(request_data.get('anvilOffsetX', 0.0))
+                anvil_offset_y = float(request_data.get('anvilOffsetY', 0.0))
+                filename = request_data.get('filename', 'image')
+
+                print(f"High-res processing: {cropped_img.size}, style: {style}")
+
+                # Generate only the requested style at high resolution
+                style_paths = generate_single_style_highres(
+                    cropped_img=cropped_img,
+                    style=style,
+                    ratio=ratio,
+                    chosen_colour_hex=colour,
+                    uid=uid,
+                    opacity=opacity,
+                    anvil_scale=anvil_scale,
+                    anvil_offset_x=anvil_offset_x,
+                    anvil_offset_y=anvil_offset_y
+                )
+                
+                style_img_path = Path(style_paths[style])
+            else:
+                print("No high-resolution data provided, using stored low-res image...")
+                # Fallback to existing low-res processing
+                style_img_path = session_dir / f"{style}.png"
+                if not style_img_path.exists():
+                    raise FileNotFoundError(f"Style image not found for {style}")
+
+            if format == "png":
+                # Send high-resolution image directly
+                with open(style_img_path, "rb") as f:
+                    data = f.read()
+                remove_job(job_id)
+                return send_file(
+                    io.BytesIO(data),
+                    mimetype='image/png',
+                    as_attachment=True,
+                    download_name=f"{uid}_{style}_8K.png"
+                )
+            elif format == "layers":
+                # For layer package, assemble ZIP with base, subject, anvil, composite
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    if high_res_data:
+                        # Use high-res generated files
+                        base_path = session_dir / f"highres_base_{style}.png"
+                        subject_path = session_dir / f"highres_subject_{style}.png"
+                        anvil_path = session_dir / f"highres_anvil_{style}.png"
+                    else:
+                        # Use existing low-res files
+                        base_path = session_dir / "base_temp.png"
+                        subject_path = session_dir / "subject_temp.png"
+                        anvil_path = None  # Not available for low-res
+                    
+                    composite_path = style_img_path
+
+                    missing_files = []
+                    if not base_path.exists():
+                        missing_files.append("01_background.png")
+                    if not subject_path.exists():
+                        missing_files.append("02_subject_cutout.png")
+                    if not composite_path.exists():
+                        missing_files.append("final_composite.png")
+
+                    if missing_files:
+                        remove_job(job_id)
+                        error_msg = (
+                            f"Missing required files for high-res layer download: {', '.join(missing_files)}.\n"
+                            "This session may have expired or preview processing did not complete correctly.\n"
+                            "Please re-run the preview generation step and try again."
+                        )
+                        return jsonify({'status': 'error', 'error': error_msg, 'job_id': job_id}), 500
+
+                    # Write existing files to zip
+                    zf.write(base_path, "01_background.png")
+                    zf.write(subject_path, "02_subject_cutout.png")
+                    
+                    # Add anvil shape layer if available (high-res only)
+                    if anvil_path and anvil_path.exists():
+                        zf.write(anvil_path, "03_anvil_shape.png")
+                    
+                    zf.write(composite_path, "final_composite.png")
+
+                    # Save README-in-ZIP
+                    anvil_layer_info = "03_anvil_shape.png - Standalone anvil shape layer\n" if (anvil_path and anvil_path.exists()) else ""
+                    readme_content = (
+                        "Layer package contents:\n"
+                        "01_background.png - Original cropped image\n"
+                        "02_subject_cutout.png - Extracted subject (if available)\n"
+                        f"{anvil_layer_info}"
+                        "final_composite.png - Final composite result\n"
+                        "README.txt - This file\n\n"
+                        "Processing details:\n"
+                        f"- Style: {style}\n"
+                        f"- Resolution: {'High-res (up to 8K)' if high_res_data else 'Preview resolution'}\n"
+                        f"- Generated by Lloyd's Anvilizer\n"
+                    )
+                    zf.writestr("README.txt", readme_content.encode('utf-8'))
+                zip_buffer.seek(0)
+                remove_job(job_id)
+                return send_file(
+                    zip_buffer,
+                    mimetype='application/zip',
+                    as_attachment=True,
+                    download_name=f"{uid}_{style}_layers.zip"
+                )
+            else:
+                remove_job(job_id)
+                return jsonify({'status': 'error', 'error': 'Unknown format', 'job_id': job_id}), 400
+
+        # lock is released here
     except Exception as e:
-        return jsonify({'error': f'Failed to load session metadata: {e}'}), 500
-    
-    # Load original image data (we'll need to store this during initial processing)
-    original_img_path = session_dir / 'original_highres.png'
-    if not original_img_path.exists():
-        return jsonify({'error': 'Original high-res image not found. Please re-upload your image.'}), 404
-    
-    try:
-        # Load the original high-resolution image
-        original_img = Image.open(original_img_path).convert('RGBA')
-        print(f"Processing high-res {style} style at {original_img.size}")
-        
-        # Apply size validation and auto-resize if needed (max 8K)
-        max_width, max_height = 7680, 4320  # 8K resolution
-        if original_img.width > max_width or original_img.height > max_height:
-            # Calculate scaling factor to fit within 8K while maintaining aspect ratio
-            scale_w = max_width / original_img.width
-            scale_h = max_height / original_img.height
-            scale = min(scale_w, scale_h)
-            
-            new_size = (int(original_img.width * scale), int(original_img.height * scale))
-            original_img = original_img.resize(new_size, Image.LANCZOS)
-            print(f"Auto-resized to {new_size} to fit within 8K limits")
-        
-        # Load processing parameters from metadata
-        colour_hex = meta_data.get('colour_hex', '#0070F2')
-        opacity = meta_data.get('opacity', 0.5)
-        anvil_scale = meta_data.get('anvil_scale', 0.7)
-        anvil_offset_x = meta_data.get('anvil_offset_x', 0.0)
-        anvil_offset_y = meta_data.get('anvil_offset_y', 0.0)
-        base_name = meta_data.get('base_name', 'image')
-        colour_slug = meta_data.get('colour_slug', 'Custom')
-        
-        # Convert hex to RGB
-        hex_colour = colour_hex.lstrip('#')
-        fill_colour = tuple(int(hex_colour[i:i+2], 16) for i in (0, 2, 4))
-        
-        # Compute anvil coordinates at high resolution
-        size = original_img.size
-        coords = compute_anvil_coords(size, anvil_scale, anvil_offset_x, anvil_offset_y)
-        
-        # Process the specific style at high resolution using original dimensions
-        if style == 'Window':
-            result_img = apply_window_style(original_img, size, fill_colour, coords=coords)
-        elif style == 'Silhouette':
-            result_img = apply_silhouette_style(original_img, size, fill_colour, opacity, coords=coords)
-        elif style == 'Flat':
-            # Use original image directly without resizing
-            result_img = original_img.convert('RGBA')
-            overlay = Image.new('RGBA', size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(overlay)
-            alpha_val = int(max(0.0, min(1.0, opacity)) * 255)
-            draw.polygon(list(coords), fill=fill_colour + (alpha_val,))
-            result_img.alpha_composite(overlay)
-        elif style == 'Stroke':
-            # Use original image directly without resizing
-            result_img = original_img.convert('RGBA')
-            stroke_layer = draw_stroke_outline(size, fill_colour, coords=coords)
-            result_img.alpha_composite(stroke_layer)
-            # Add subject cutout if available
-            if _has_rembg:
-                arr = remove_background_human(np.array(original_img.convert('RGB')))
-                if arr is not None:
-                    subject_img = Image.fromarray(arr).convert('RGBA')
-                    result_img.alpha_composite(subject_img)
-        elif style == 'Gradient':
-            # Use original image directly without resizing
-            result_img = original_img.convert('RGBA')
-            grad_stops = get_gradient_stops(colour_hex)
-            gradient_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
-            result_img.alpha_composite(gradient_overlay)
-        elif style == 'Gradient Silhouette':
-            result_img = apply_silhouette_style(original_img, size, fill_colour, opacity, coords=coords)
-            # Replace flat overlay with gradient - use original image directly
-            base_img = original_img.convert('RGBA')
-            grad_stops = get_gradient_stops(colour_hex)
-            gradient_overlay = gradient_fill_anvil(size, grad_stops, coords=coords)
-            base_img.alpha_composite(gradient_overlay)
-            # Add subject cutout
-            if _has_rembg:
-                arr = remove_background_human(np.array(original_img.convert('RGB')))
-                if arr is not None:
-                    subject_img = Image.fromarray(arr).convert('RGBA')
-                    base_img.alpha_composite(subject_img)
-            result_img = base_img
-        else:
-            return jsonify({'error': f'Unknown style: {style}'}), 400
-        
-        # Return based on requested format
-        if format == 'png':
-            # Return high-resolution PNG
-            img_buffer = io.BytesIO()
-            result_img.save(img_buffer, format='PNG')
-            img_buffer.seek(0)
-            
-            download_name = f"{base_name}_{style.lower()}_{colour_slug}_8K.png"
-            return send_file(img_buffer, mimetype='image/png', as_attachment=True,
-                           download_name=download_name)
-        
-        elif format == 'layers':
-            # Create layer package
-            from layer_package_generator import create_layer_package, get_layer_components_from_style
-            
-            # Extract layer components
-            background, subject_cutout, anvil_overlay = get_layer_components_from_style(
-                original_img, style, fill_colour, coords, opacity
-            )
-            
-            # Create layer package ZIP
-            resolution_str = f"{size[0]}x{size[1]}"
-            zip_bytes = create_layer_package(
-                background, subject_cutout, anvil_overlay, result_img,
-                style, colour_slug, colour_hex, base_name, resolution_str
-            )
-            
-            zip_buffer = io.BytesIO(zip_bytes)
-            download_name = f"{base_name}_{style.lower()}_{colour_slug}_layers.zip"
-            
-            return send_file(zip_buffer, mimetype='application/zip', as_attachment=True,
-                           download_name=download_name)
-    
-    except Exception as e:
-        print(f"Error in high-res processing: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': f'High-resolution processing failed: {str(e)}'}), 500
+        remove_job(job_id)
+        return jsonify({'status': 'error', 'error': str(e), 'job_id': job_id}), 500
 
 
 def save_log_image(image: Image.Image, uid: str) -> None:
@@ -1173,18 +1292,49 @@ def save_log_image(image: Image.Image, uid: str) -> None:
         print(f"Warning: Could not save log image: {e}")
 
 
-def cleanup_generated_files() -> None:
-    """Clean up all generated files before processing new images."""
+def cleanup_old_sessions(max_age_hours: int = 24) -> None:
+    """Clean up session directories older than specified hours.
+    
+    Args:
+        max_age_hours: Maximum age in hours before a session is considered old
+    """
     try:
+        import time
         import shutil
-        if OUTPUT_DIR.exists():
-            # Remove all session directories
-            for session_dir in OUTPUT_DIR.iterdir():
-                if session_dir.is_dir():
-                    shutil.rmtree(session_dir, ignore_errors=True)
-            print("Cleaned up all generated files")
+        
+        if not OUTPUT_DIR.exists():
+            return
+            
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600  # Convert hours to seconds
+        cleaned_count = 0
+        
+        for session_dir in OUTPUT_DIR.iterdir():
+            if session_dir.is_dir():
+                try:
+                    # Get the modification time of the session directory
+                    dir_mtime = session_dir.stat().st_mtime
+                    age_seconds = current_time - dir_mtime
+                    
+                    if age_seconds > max_age_seconds:
+                        shutil.rmtree(session_dir, ignore_errors=True)
+                        cleaned_count += 1
+                        print(f"Cleaned up old session: {session_dir.name} (age: {age_seconds/3600:.1f}h)")
+                except Exception as e:
+                    print(f"Error cleaning session {session_dir.name}: {e}")
+                    
+        if cleaned_count > 0:
+            print(f"Cleaned up {cleaned_count} old session(s)")
+        else:
+            print("No old sessions to clean up")
+            
     except Exception as e:
-        print(f"Error during generated files cleanup: {e}")
+        print(f"Error during session cleanup: {e}")
+
+
+def cleanup_generated_files() -> None:
+    """Legacy function - now calls cleanup_old_sessions for backwards compatibility."""
+    cleanup_old_sessions(24)
 
 
 def get_image_count() -> int:
@@ -1201,22 +1351,178 @@ def get_image_count() -> int:
         return 0
 
 
-def cleanup_old_sessions(max_sessions: int = 20) -> None:
-    """Remove old session directories to avoid cluttering disk."""
+# --- Admin routes and helpers ---
+import socket
+from datetime import datetime
+
+def list_log_thumbnails(page=1, per_page=100):
+    """Return paginated thumbnails from LOGS_DIR (sorted newest first)."""
     try:
-        sessions = sorted((d for d in OUTPUT_DIR.iterdir() if d.is_dir()),
-                          key=lambda d: d.stat().st_mtime, reverse=True)
-        for old in sessions[max_sessions:]:
-            import shutil
-            shutil.rmtree(old, ignore_errors=True)
-            print(f"Cleaned up old session: {old}")
+        files = sorted(
+            [f for f in LOGS_DIR.glob("*.jpg")],
+            key=lambda f: f.stat().st_mtime,
+            reverse=True
+        )
+        
+        total_count = len(files)
+        start_idx = (page - 1) * per_page
+        end_idx = start_idx + per_page
+        page_files = files[start_idx:end_idx]
+        
+        thumbnails = []
+        for f in page_files:
+            dt = datetime.fromtimestamp(f.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+            thumbnails.append({
+                "filename": f.name,
+                "timestamp": dt,
+                "url": url_for('admin_log_image', filename=f.name)
+            })
+        
+        return {
+            "thumbnails": thumbnails,
+            "total_count": total_count,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": (total_count + per_page - 1) // per_page,
+            "has_next": end_idx < total_count,
+            "has_prev": page > 1
+        }
     except Exception as e:
-        print(f"Error during session cleanup: {e}")
+        print(f"Error listing thumbnails: {e}")
+        return {
+            "thumbnails": [],
+            "total_count": 0,
+            "page": 1,
+            "per_page": per_page,
+            "total_pages": 0,
+            "has_next": False,
+            "has_prev": False
+        }
+
+def list_sessions():
+    """Return details for all session dirs in OUTPUT_DIR, sorted newest first."""
+    sessions = []
+    for session_dir in sorted(OUTPUT_DIR.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+        if not session_dir.is_dir():
+            continue
+        uid = session_dir.name
+        try:
+            created = datetime.fromtimestamp(session_dir.stat().st_ctime).strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            created = "?"
+        
+        images = []
+        status = []
+        expected_styles = ['Flat', 'Stroke', 'Gradient', 'Window', 'Silhouette', 'Gradient Silhouette']
+        
+        for style in expected_styles:
+            style_file = session_dir / f"{style}.png"
+            if style_file.exists():
+                images.append({
+                    "style": style,
+                    "url": url_for('download', uid=uid, style_name=style),
+                    "thumb": url_for('admin_session_thumb', uid=uid, style=style)
+                })
+            else:
+                status.append(f"missing {style}")
+        
+        base_temp = session_dir / "base_temp.png"
+        if not base_temp.exists():
+            status.append("missing base")
+        
+        if not images:
+            status.append("no images")
+        
+        sessions.append({
+            "uid": uid,
+            "created": created,
+            "images": images,
+            "status": ", ".join(status) if status else "ok"
+        })
+    return sessions
+
+@app.route("/admin")
+def admin_page():
+    """Admin HTML with server/pod name injected."""
+    pod_name = socket.gethostname()
+    return render_template("admin.html", pod_name=pod_name)
+
+@app.route("/admin/api/logs")
+def admin_logs_api():
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 100))
+    return jsonify(list_log_thumbnails(page=page, per_page=per_page))
+
+@app.route("/admin/api/sessions")
+def admin_sessions_api():
+    return jsonify({"sessions": list_sessions()})
+
+@app.route("/admin/api/queue")
+def admin_queue_api():
+    # Exposes the current memory queue, active job id, processed images, pod_name
+    with queue_lock:
+        queue_list = [
+            {
+                "job_id": job.job_id,
+                "route": job.route,
+                "params": job.params,
+                "status": job.status
+            }
+            for job in processing_queue
+        ]
+        active = active_job_id
+    
+    return jsonify({
+        "queue": queue_list,
+        "active_job_id": active,
+        "images_processed": get_image_count(),
+        "pod_name": socket.gethostname()
+    })
+
+@app.route("/admin/api/session/<uid>/delete", methods=["POST"])
+def admin_delete_session(uid):
+    """Delete the whole session directory."""
+    from shutil import rmtree
+    session_dir = OUTPUT_DIR / uid
+    if not session_dir.exists() or not session_dir.is_dir():
+        return jsonify({"success": False, "error": "Session not found."})
+    
+    try:
+        rmtree(session_dir)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/admin/logs/<filename>")
+def admin_log_image(filename):
+    """Serve jpg log file from LOGS_DIR."""
+    file_path = LOGS_DIR / filename
+    if not file_path.exists():
+        return "Not found", 404
+    return send_file(str(file_path), mimetype="image/jpeg")
+
+@app.route("/admin/sessions/<uid>/<style>")
+def admin_session_thumb(uid, style):
+    """Serve a downsampled PNG for session preview style."""
+    session_dir = OUTPUT_DIR / uid
+    style_file = session_dir / f"{style}.png"
+    if not style_file.exists():
+        return "Not found", 404
+    
+    try:
+        img = Image.open(style_file).convert("RGBA")
+        img.thumbnail((60, 45))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+    except Exception:
+        return "Error", 500
 
 
 if __name__ == '__main__':
-    # Clean up old sessions on startup
-    cleanup_old_sessions()
+    # Clean up old sessions on startup (24-hour retention)
+    cleanup_old_sessions(24)
 
     # Get port from environment variable for Cloud Foundry deployment
     import os

@@ -565,14 +565,19 @@ generateBtn.addEventListener('click', function () {
     })
         .then(response => response.json())
         .then(data => {
-            if (data.error) {
-                alert('Error: ' + data.error);
+            // Handle image queue information
+            if (data.status === 'queued' && data.job_id) {
+                pollQueueStatus(data.job_id, 'process');
                 return;
             }
+            if (data.status === 'error') {
+                alert('Error: ' + data.error);
+                if (loadingOverlay) loadingOverlay.style.display = 'none';
+                return;
+            }
+            // Completed
             renderPreviews(data.uid, data.previews);
-            // Update counter after successful processing
             loadUsageStats();
-            // Hide loading overlay after previews rendered
             if (loadingOverlay) {
                 loadingOverlay.style.display = 'none';
                 stopStatusRotation();
@@ -585,6 +590,41 @@ generateBtn.addEventListener('click', function () {
                 loadingOverlay.style.display = 'none';
             }
         });
+
+function pollQueueStatus(jobId, routeType) {
+    let pollingInterval = setInterval(() => {
+        fetch(`/queue_status/${jobId}`)
+            .then(resp => resp.json())
+            .then(qdata => {
+                // Update UI with queue info
+                if (loadingOverlay) {
+                    let textElem = loadingOverlay.querySelector('.processing-status-text');
+                    if (textElem) {
+                        if (qdata.position && qdata.position > 1)
+                            textElem.textContent = `In queue: You are #${qdata.position} for processing`;
+                        else
+                            textElem.textContent = 'Processing started...';
+                    }
+                }
+                if (qdata.status === "done") {
+                    clearInterval(pollingInterval);
+                    // Optionally, trigger a page reload or refresh the preview grid
+                    // For now, simply reload for new result
+                    window.location.reload();
+                }
+                if (qdata.status === "error" || qdata.status === "not_found") {
+                    clearInterval(pollingInterval);
+                    alert('Image processing failed, please try again.');
+                    if (loadingOverlay) loadingOverlay.style.display = 'none';
+                }
+            })
+            .catch(() => {
+                clearInterval(pollingInterval);
+                alert('Queue polling failed. Please refresh.');
+                if (loadingOverlay) loadingOverlay.style.display = 'none';
+            });
+    }, 2000);
+}
 });
 
 // Render preview grid
@@ -1089,10 +1129,35 @@ function startHighResProcessing(uid, style, format) {
         }
     }, 15000);
     
+    // Prepare the high-resolution processing request payload
+    let requestPayload = {};
+    
+    // Include high-resolution image data if available
+    if (window.currentHighResData && window.currentHighResData.dataUrl) {
+        requestPayload.highResImageData = window.currentHighResData.dataUrl;
+        requestPayload.highResDimensions = window.currentHighResData.dimensions;
+        requestPayload.originalCrop = window.currentHighResData.originalCrop;
+        requestPayload.naturalDimensions = window.currentHighResData.naturalDimensions;
+        
+        console.log(`High-res processing with original data: ${window.currentHighResData.dimensions.width}x${window.currentHighResData.dimensions.height}`);
+        
+        // Also include current anvil settings for high-res processing
+        requestPayload.anvilScale = anvilScale;
+        requestPayload.anvilOffsetX = anvilOffsetX;
+        requestPayload.anvilOffsetY = anvilOffsetY;
+        requestPayload.opacity = opacitySlider ? parseFloat(opacitySlider.value) / 100.0 : 0.5;
+        requestPayload.colour = selectedColour;
+        requestPayload.ratio = document.querySelector('input[name="ratio"]:checked').value;
+        requestPayload.filename = uploadFilename;
+    } else {
+        console.warn('No high-resolution data available, falling back to stored low-res image');
+    }
+    
     // Start the processing request
     fetch(`/process_highres/${uid}/${style}/${format}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestPayload)
     })
     .then(response => {
         if (!response.ok) {

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+ <meta charset="UTF-8">
+ <title>Anvilizer Admin</title>
+ <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+ <script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+ <div class="admin-container">
+ <header>
+ <h1>Anvilizer Admin Panel</h1>
+ <div class="pod-info">Pod: <span id="pod-name">{{ pod_name }}</span></div>
+ </header>
+ <section>
+ <h2>Recent Thumbnails</h2>
+ <div id="thumbnail-grid" class="thumbnail-grid"></div>
+ </section>
+ <section>
+ <h2>Sessions</h2>
+ <div id="sessions-table-container">
+ <table id="sessions-table">
+ <thead>
+ <tr>
+ <th>UID</th>
+ <th>Created</th>
+ <th>Images</th>
+ <th>Status</th>
+ <th>Delete</th>
+ </tr>
+ </thead>
+ <tbody id="sessions-table-body">
+ <!-- JS populates session rows -->
+ </tbody>
+ </table>
+ </div>
+ </section>
+ <section>
+ <h2>Queue Info</h2>
+ <pre id="queue-info" class="queue-info"></pre>
+ </section>
+ <section>
+ <h2>Stats</h2>
+ <div id="stats-summary" class="stats-summary"></div>
+ </section>
+ </div>
+</body>
+</html>
