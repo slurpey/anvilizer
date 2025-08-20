@@ -47,10 +47,19 @@ from pathlib import Path
 import json
 from typing import Dict, Tuple, List, Optional, Any
 
-from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, abort
 import zipfile
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import numpy as np  # type: ignore
+
+# Import security fixes
+from security_fixes import (
+    validate_image_data, validate_numeric_parameter, validate_uid,
+    validate_style_name, validate_filename, validate_color_hex,
+    create_secure_csp_header, require_admin_auth, log_security_event,
+    handle_validation_error, create_limiter,
+    UPLOAD_RATE_LIMIT, DOWNLOAD_RATE_LIMIT, ADMIN_RATE_LIMIT
+)
 
 # --- Configuration for Local Execution ---
 # Maximum pixels for square images to manage memory usage locally.
@@ -73,6 +82,9 @@ except Exception as e:
 
 # Initialise Flask app
 app = Flask(__name__)
+
+# Initialize rate limiter
+limiter = create_limiter(app)
 
 # --- Queue System ---
 class ProcessingJob:
@@ -130,11 +142,16 @@ def queue_status(job_id):
     status = job_status(job_id)
     return jsonify({"position": pos, "status": status})
 
-# Configure CSP with more permissive policy to handle browser extensions
+# Configure secure CSP header
 @app.after_request
 def set_csp_header(response):
-    # More permissive CSP that allows browser extensions while maintaining security
-    response.headers['Content-Security-Policy'] = "script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self';"
+    # Secure CSP that protects against XSS and other attacks
+    response.headers['Content-Security-Policy'] = create_secure_csp_header()
+    # Additional security headers
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     return response
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -975,8 +992,9 @@ def index() -> Any:
 
 
 @app.route('/process', methods=['POST'])
+@limiter.limit(UPLOAD_RATE_LIMIT)
 def process() -> Any:
-    """Queue-protected: Handle image and generate previews."""
+    """Queue-protected: Handle image and generate previews with security validation."""
 
     data = request.get_json(force=True)
     job_id = add_job_to_queue("preview", data)
@@ -993,20 +1011,47 @@ def process() -> Any:
             session_locks[uid] = threading.Lock()
         lock = session_locks[uid]
         with lock:
-            # Decode preview (moderate resolution) image sent by frontend cropper
+            # Secure validation of image data
             preview_data_url = data.get('imageData')
             if not preview_data_url:
-                raise ValueError("Missing preview image data")
-            cropped_img = decode_image(preview_data_url)
+                log_security_event("Missing image data", request.remote_addr)
+                return handle_validation_error("Missing preview image data")
+            
+            # Validate and decode image securely
+            try:
+                cropped_img = validate_image_data(preview_data_url)
+            except ValueError as e:
+                log_security_event(f"Invalid image data: {str(e)}", request.remote_addr)
+                return handle_validation_error(f"Invalid image data: {str(e)}")
 
-            # Frontend sends all crop/anvil params
+            # Validate and sanitize input parameters
             ratio = data.get('ratio', '16:9')
+            if ratio not in ['16:9', '1:1']:
+                log_security_event(f"Invalid ratio: {ratio}", request.remote_addr)
+                return handle_validation_error("Invalid aspect ratio")
+            
             colour = data.get('colour', '#0070F2')
-            opacity = float(data.get('opacity', 0.5))
-            anvilScale = float(data.get('anvilScale', 0.7))
-            anvilOffsetX = float(data.get('anvilOffsetX', 0.0))
-            anvilOffsetY = float(data.get('anvilOffsetY', 0.0))
+            if not validate_color_hex(colour):
+                log_security_event(f"Invalid color: {colour}", request.remote_addr)
+                return handle_validation_error("Invalid color format")
+            
+            # Validate numeric parameters
+            try:
+                opacity = validate_numeric_parameter(data.get('opacity', 0.5), 'opacity', 0.0, 1.0, 0.5)
+                anvilScale = validate_numeric_parameter(data.get('anvilScale', 0.7), 'anvilScale', 0.1, 1.0, 0.7)
+                anvilOffsetX = validate_numeric_parameter(data.get('anvilOffsetX', 0.0), 'anvilOffsetX', -1.0, 1.0, 0.0)
+                anvilOffsetY = validate_numeric_parameter(data.get('anvilOffsetY', 0.0), 'anvilOffsetY', -1.0, 1.0, 0.0)
+            except ValueError as e:
+                log_security_event(f"Invalid numeric parameter: {str(e)}", request.remote_addr)
+                return handle_validation_error(str(e))
+            
+            # Validate filename
             filename = data.get('filename') or "image"
+            try:
+                filename = validate_filename(filename)
+            except ValueError as e:
+                log_security_event(f"Invalid filename: {str(e)}", request.remote_addr)
+                return handle_validation_error(str(e))
 
             # Generate previews for all styles, save to disk, return as base64 for speed
             style_paths = generate_styles_sequential(
@@ -1037,11 +1082,27 @@ def process() -> Any:
 
 
 @app.route('/download/<uid>/<style_name>')
+@limiter.limit(DOWNLOAD_RATE_LIMIT)
 def download(uid: str, style_name: str) -> Any:
-    """Serve the requested high‑resolution image as an attachment."""
+    """Serve the requested high‑resolution image as an attachment with security validation."""
+    # Validate UID format
+    try:
+        uid = validate_uid(uid)
+    except ValueError as e:
+        log_security_event(f"Invalid UID in download: {str(e)}", request.remote_addr)
+        return "Invalid session ID", 400
+    
+    # Validate style name
+    try:
+        style_name = validate_style_name(style_name)
+    except ValueError as e:
+        log_security_event(f"Invalid style name in download: {str(e)}", request.remote_addr)
+        return "Invalid style name", 400
+    
     session_dir = OUTPUT_DIR / uid
     file_path = session_dir / f"{style_name}.png"
     if not file_path.exists():
+        log_security_event(f"File not found: {uid}/{style_name}", request.remote_addr)
         return "Not found", 404
     # Load metadata to construct a friendly filename
     meta_path = session_dir / 'meta.json'
@@ -1442,23 +1503,34 @@ def list_sessions():
     return sessions
 
 @app.route("/admin")
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_page():
-    """Admin HTML with server/pod name injected."""
+    """Admin HTML with server/pod name injected and security protection."""
     pod_name = socket.gethostname()
     return render_template("admin.html", pod_name=pod_name)
 
 @app.route("/admin/api/logs")
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_logs_api():
+    """Admin API for logs with security protection."""
     page = int(request.args.get('page', 1))
     per_page = int(request.args.get('per_page', 100))
     return jsonify(list_log_thumbnails(page=page, per_page=per_page))
 
 @app.route("/admin/api/sessions")
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_sessions_api():
+    """Admin API for sessions with security protection."""
     return jsonify({"sessions": list_sessions()})
 
 @app.route("/admin/api/queue")
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_queue_api():
+    """Admin API for queue status with security protection."""
     # Exposes the current memory queue, active job id, processed images, pod_name
     with queue_lock:
         queue_list = [
@@ -1480,8 +1552,17 @@ def admin_queue_api():
     })
 
 @app.route("/admin/api/session/<uid>/delete", methods=["POST"])
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_delete_session(uid):
-    """Delete the whole session directory."""
+    """Delete the whole session directory with security protection."""
+    # Validate UID format
+    try:
+        uid = validate_uid(uid)
+    except ValueError as e:
+        log_security_event(f"Invalid UID in admin delete: {str(e)}", request.remote_addr)
+        return jsonify({"success": False, "error": "Invalid session ID"})
+    
     from shutil import rmtree
     session_dir = OUTPUT_DIR / uid
     if not session_dir.exists() or not session_dir.is_dir():
@@ -1489,21 +1570,42 @@ def admin_delete_session(uid):
     
     try:
         rmtree(session_dir)
+        log_security_event(f"Admin deleted session: {uid}", request.remote_addr)
         return jsonify({"success": True})
     except Exception as e:
+        log_security_event(f"Admin delete session failed: {uid} - {str(e)}", request.remote_addr)
         return jsonify({"success": False, "error": str(e)})
 
 @app.route("/admin/logs/<filename>")
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_log_image(filename):
-    """Serve jpg log file from LOGS_DIR."""
+    """Serve jpg log file from LOGS_DIR with security protection."""
+    # Validate filename to prevent path traversal
+    try:
+        filename = validate_filename(filename)
+    except ValueError as e:
+        log_security_event(f"Invalid filename in admin logs: {str(e)}", request.remote_addr)
+        return "Invalid filename", 400
+    
     file_path = LOGS_DIR / filename
     if not file_path.exists():
         return "Not found", 404
     return send_file(str(file_path), mimetype="image/jpeg")
 
 @app.route("/admin/sessions/<uid>/<style>")
+@limiter.limit(ADMIN_RATE_LIMIT)
+@require_admin_auth
 def admin_session_thumb(uid, style):
-    """Serve a downsampled PNG for session preview style."""
+    """Serve a downsampled PNG for session preview style with security protection."""
+    # Validate UID and style name
+    try:
+        uid = validate_uid(uid)
+        style = validate_style_name(style)
+    except ValueError as e:
+        log_security_event(f"Invalid parameters in admin thumb: {str(e)}", request.remote_addr)
+        return "Invalid parameters", 400
+    
     session_dir = OUTPUT_DIR / uid
     style_file = session_dir / f"{style}.png"
     if not style_file.exists():
