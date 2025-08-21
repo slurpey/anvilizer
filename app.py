@@ -1792,4 +1792,4 @@ if __name__ == '__main__':
     print(f"Images processed so far: {get_image_count()}")
     
     # Start the Flask development server
-    app.run(host='127.0.0.1', port=5000, debug=True, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
