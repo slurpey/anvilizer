@@ -126,7 +126,13 @@ fileInput.addEventListener('change', function (e) {
 function setupCropBox() {
     // Determine aspect ratio from selected radio
     const ratioVal = document.querySelector('input[name="ratio"]:checked').value;
-    currentRatio = ratioVal === '1:1' ? 1 : 16 / 9;
+    if (ratioVal === '1:1') {
+        currentRatio = 1;
+    } else if (ratioVal === '9:16') {
+        currentRatio = 9 / 16;
+    } else {
+        currentRatio = 16 / 9;
+    }
     const wrapperWidth = cropWrapper.clientWidth;
     const wrapperHeight = cropWrapper.clientHeight;
     // Compute crop box maximum size so that it fills the wrapper as much
@@ -171,7 +177,13 @@ function setupCropBox() {
 // Ratio change listener to update crop box
 document.querySelectorAll('input[name="ratio"]').forEach(function (elem) {
     elem.addEventListener('change', function () {
-        currentRatio = this.value === '1:1' ? 1 : 16 / 9;
+        if (this.value === '1:1') {
+            currentRatio = 1;
+        } else if (this.value === '9:16') {
+            currentRatio = 9 / 16;
+        } else {
+            currentRatio = 16 / 9;
+        }
         // For the custom crop box, rebuild it to match the new ratio
         setupCropBox();
         // Update mask and anvil preview to reflect the ratio change
@@ -447,7 +459,14 @@ function resetAllSliders() {
     const ratio16x9 = document.querySelector('input[name="ratio"][value="16:9"]');
     if (ratio16x9) {
         ratio16x9.checked = true;
-        currentRatio = 16 / 9;
+        // Use the same logic as other functions
+        if (ratio16x9.value === '1:1') {
+            currentRatio = 1;
+        } else if (ratio16x9.value === '9:16') {
+            currentRatio = 9 / 16;
+        } else {
+            currentRatio = 16 / 9;
+        }
         if (imageElement.src) {
             setupCropBox();
         }
@@ -475,10 +494,19 @@ generateBtn.addEventListener('click', function () {
     const ratioValue = document.querySelector('input[name="ratio"]:checked').value;
     
     // TWO-TIER APPROACH: Preview processing vs High-res processing
-    // For PREVIEW generation: Use moderate resolution for speed (1920x1080)
+    // For PREVIEW generation: Use moderate resolution for speed
     // For HIGH-RES processing: Use original crop dimensions (stored separately)
-    let previewTargetW = 1920;
-    let previewTargetH = ratioValue === '1:1' ? 1920 : 1080;
+    let previewTargetW, previewTargetH;
+    if (ratioValue === '1:1') {
+        previewTargetW = 1920;
+        previewTargetH = 1920;
+    } else if (ratioValue === '9:16') {
+        previewTargetW = 1080;  // Phone portrait: narrower width
+        previewTargetH = 1920;  // Phone portrait: taller height
+    } else {
+        previewTargetW = 1920;  // Landscape: wider width
+        previewTargetH = 1080;  // Landscape: shorter height
+    }
     
     // Determine the bounding rectangles of the displayed image and the crop box
     const imgRect = imageElement.getBoundingClientRect();
@@ -520,8 +548,12 @@ generateBtn.addEventListener('click', function () {
         const maxDim = Math.min(sw, sh);
         highresW = maxDim;
         highresH = maxDim;
+    } else if (ratioValue === '9:16') {
+        // For phone portrait, preserve the crop dimensions
+        highresW = sw;
+        highresH = sh;
     } else {
-        // For 16:9, preserve the crop dimensions up to reasonable limits
+        // For 16:9 landscape, preserve the crop dimensions up to reasonable limits
         highresW = sw;
         highresH = sh;
     }

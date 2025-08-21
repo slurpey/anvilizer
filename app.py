@@ -275,7 +275,7 @@ def upscale_image_if_needed(img: Image.Image, ratio: str) -> Image.Image:
 
     Args:
         img: Cropped PIL Image in RGBA mode.
-        ratio: Either '16:9' or '1:1'.
+        ratio: Either '16:9', '1:1', or '9:16'.
 
     Returns:
         Upscaled PIL Image (original size preserved for high-quality processing).
@@ -284,6 +284,9 @@ def upscale_image_if_needed(img: Image.Image, ratio: str) -> Image.Image:
     if ratio == '16:9':
         target_w, target_h = 7680, 4320  # 8K UHD
         max_w, max_h = 7680, 4320
+    elif ratio == '9:16':
+        target_w, target_h = 4320, 7680  # 8K portrait (phone)
+        max_w, max_h = 4320, 7680
     else:  # 1:1
         target_w, target_h = 7680, 7680  # 8K square
         max_w, max_h = 7680, 7680
@@ -591,7 +594,7 @@ def generate_single_style_highres(cropped_img: Image.Image, style: str, ratio: s
     Args:
         cropped_img: High-resolution PIL Image (RGBA).
         style: Style name to generate ('Flat', 'Stroke', etc.).
-        ratio: Aspect ratio ('16:9' or '1:1').
+        ratio: Aspect ratio ('16:9', '1:1', or '9:16').
         chosen_colour_hex: Hex color code.
         uid: Unique session identifier.
         opacity: Opacity for color overlays (0.0-1.0).
@@ -1004,7 +1007,7 @@ def process_preview_job(params):
 
 # Validate and sanitize input parameters
         ratio = data.get('ratio', '16:9')
-        if ratio not in ['16:9', '1:1']:
+        if ratio not in ['16:9', '1:1', '9:16']:
             log_security_event(f"Invalid ratio: {ratio}", params.get('remote_addr', 'unknown'))
             raise ValueError("Invalid aspect ratio")
         
