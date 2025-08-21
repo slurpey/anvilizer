@@ -38,6 +38,7 @@ The code gracefully degrades if rembg is unavailable.
 import base64
 import io
 import os
+import re
 import uuid
 import gc
 import threading
@@ -1001,16 +1002,14 @@ def process_preview_job(params):
             log_security_event(f"Invalid image data: {str(e)}", params.get('remote_addr', 'unknown'))
             raise ValueError(f"Invalid image data: {str(e)}")
 
-        # Validate and sanitize input parameters
+# Validate and sanitize input parameters
         ratio = data.get('ratio', '16:9')
         if ratio not in ['16:9', '1:1']:
             log_security_event(f"Invalid ratio: {ratio}", params.get('remote_addr', 'unknown'))
             raise ValueError("Invalid aspect ratio")
         
         colour = data.get('colour', '#0070F2')
-        if not validate_color_hex(colour):
-            log_security_event(f"Invalid color: {colour}", params.get('remote_addr', 'unknown'))
-            raise ValueError("Invalid color format")
+        colour = validate_color_hex(colour)  # This returns a valid color or default
         
         # Validate numeric parameters
         try:
@@ -1085,17 +1084,15 @@ def process() -> Any:
 def download(uid: str, style_name: str) -> Any:
     """Serve the requested high‑resolution image as an attachment with security validation."""
     # Validate UID format
-    try:
-        uid = validate_uid(uid)
-    except ValueError as e:
-        log_security_event(f"Invalid UID in download: {str(e)}", request.remote_addr)
+# Validate UID format
+    if not uid or not isinstance(uid, str) or len(uid) != 32 or not re.match(r'^[a-f0-9]{32}$', uid):
+        log_security_event(f"Invalid UID in download: {uid}", request.remote_addr)
         return "Invalid session ID", 400
     
     # Validate style name
-    try:
-        style_name = validate_style_name(style_name)
-    except ValueError as e:
-        log_security_event(f"Invalid style name in download: {str(e)}", request.remote_addr)
+    allowed_styles = {'Flat', 'Stroke', 'Gradient', 'Window', 'Silhouette', 'Gradient Silhouette'}
+    if style_name not in allowed_styles:
+        log_security_event(f"Invalid style name in download: {style_name}", request.remote_addr)
         return "Invalid style name", 400
     
     session_dir = OUTPUT_DIR / uid
@@ -1163,7 +1160,7 @@ def download_all(uid: str) -> Any:
 @app.route('/process_highres/<uid>/<style>/<format>', methods=['POST'])
 @limiter.limit(UPLOAD_RATE_LIMIT)
 def process_high_resolution(uid: str, style: str, format: str) -> Any:
-    """Queue-protected: High-res image processing with optional high-resolution image data."""
+    """Process high-res image and return the file directly."""
     try:
         # Validate parameters
         uid = validate_uid(uid)
@@ -1171,27 +1168,159 @@ def process_high_resolution(uid: str, style: str, format: str) -> Any:
         if format not in ['png', 'layers']:
             raise ValueError("Invalid format")
         
-        # Submit high-res job to queue processor
-        job_params = {
-            "uid": uid, 
-            "style": style, 
-            "format": format,
-            "request_data": request.get_json() or {},
-            "remote_addr": request.remote_addr
-        }
-        job_id = processor.submit_job('highres', job_params)
+        # Get request data
+        request_data = request.get_json() or {}
         
-        return jsonify({
-            "status": "queued", 
-            "job_id": job_id
-        }), 202
+        # Process synchronously for high-res (don't use queue for file downloads)
+        # Use per-session lock
+        if uid not in session_locks:
+            session_locks[uid] = threading.Lock()
+        lock = session_locks[uid]
         
+        with lock:
+            session_dir = OUTPUT_DIR / uid
+            if not session_dir.exists():
+                return jsonify({"status": "error", "error": "Session not found"}), 404
+            
+            # Check for high-resolution image data
+            high_res_data = request_data.get('highResImageData')
+            
+            if high_res_data and high_res_data.startswith('data:image'):
+                print("High-resolution image data provided, processing from original image...")
+                
+# Decode and validate high-resolution image
+                try:
+                    cropped_img = validate_image_data(high_res_data)
+                except ValueError as e:
+                    log_security_event(f"Invalid high-res image data: {str(e)}", request.remote_addr)
+                    return jsonify({"status": "error", "error": str(e)}), 400
+                
+                # Get processing parameters
+                ratio = request_data.get('ratio', '16:9')
+                colour = request_data.get('colour', '#0070F2')
+                
+                # Validate and fix color (validate_color_hex returns a valid color or default)
+                colour = validate_color_hex(colour)
+                
+                # Validate numeric parameters
+                try:
+                    opacity = validate_numeric_parameter(
+                        request_data.get('opacity', 0.5), 'opacity', 0.0, 1.0, 0.5
+                    )
+                    anvil_scale = validate_numeric_parameter(
+                        request_data.get('anvilScale', 0.7), 'anvilScale', 0.1, 1.0, 0.7
+                    )
+                    anvil_offset_x = validate_numeric_parameter(
+                        request_data.get('anvilOffsetX', 0.0), 'anvilOffsetX', -1.0, 1.0, 0.0
+                    )
+                    anvil_offset_y = validate_numeric_parameter(
+                        request_data.get('anvilOffsetY', 0.0), 'anvilOffsetY', -1.0, 1.0, 0.0
+                    )
+                except ValueError as e:
+                    log_security_event(f"Invalid numeric parameter: {str(e)}", request.remote_addr)
+                    return jsonify({"status": "error", "error": str(e)}), 400
+                
+                print(f"High-res processing: {cropped_img.size}, style: {style}")
+                
+                # Generate only the requested style at high resolution
+                style_paths = generate_single_style_highres(
+                    cropped_img=cropped_img,
+                    style=style,
+                    ratio=ratio,
+                    chosen_colour_hex=colour,
+                    uid=uid,
+                    opacity=opacity,
+                    anvil_scale=anvil_scale,
+                    anvil_offset_x=anvil_offset_x,
+                    anvil_offset_y=anvil_offset_y
+                )
+                
+                style_img_path = Path(style_paths[style])
+            else:
+                print("No high-resolution data provided, using stored low-res image...")
+                # Fallback to existing low-res processing
+                style_img_path = session_dir / f"{style}.png"
+                if not style_img_path.exists():
+                    return jsonify({"status": "error", "error": "Style image not found"}), 404
+            
+            # Now handle the file response directly
+            if format == "png":
+                # Send high-resolution PNG image directly
+                if not style_img_path.exists():
+                    return jsonify({"status": "error", "error": "Generated image not found"}), 404
+                
+                return send_file(
+                    str(style_img_path),
+                    mimetype='image/png',
+                    as_attachment=True,
+                    download_name=f"{uid}_{style}_8K.png"
+                )
+                
+            elif format == "layers":
+                # Create layer package ZIP
+                zip_buffer = io.BytesIO()
+                
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    if high_res_data:
+                        # Use high-res generated files
+                        base_path = session_dir / f"highres_base_{style}.png"
+                        subject_path = session_dir / f"highres_subject_{style}.png"
+                        anvil_path = session_dir / f"highres_anvil_{style}.png"
+                    else:
+                        # Use existing low-res files
+                        base_path = session_dir / "base_temp.png"
+                        subject_path = session_dir / "subject_temp.png"
+                        anvil_path = None  # Not available for low-res
+                    
+                    composite_path = style_img_path
+                    
+                    # Check if required files exist
+                    if not base_path.exists() or not subject_path.exists() or not composite_path.exists():
+                        return jsonify({
+                            "status": "error",
+                            "error": "Required files missing. Please regenerate preview."
+                        }), 500
+                    
+                    # Add files to ZIP
+                    zf.write(base_path, "01_background.png")
+                    zf.write(subject_path, "02_subject_cutout.png")
+                    
+                    if anvil_path and anvil_path.exists():
+                        zf.write(anvil_path, "03_anvil_shape.png")
+                    
+                    zf.write(composite_path, "final_composite.png")
+                    
+                    # Add README
+                    anvil_layer_info = "03_anvil_shape.png - Standalone anvil shape layer\n" if (anvil_path and anvil_path.exists()) else ""
+                    readme_content = (
+                        "Layer package contents:\n"
+                        "01_background.png - Original cropped image\n"
+                        "02_subject_cutout.png - Extracted subject (if available)\n"
+                        f"{anvil_layer_info}"
+                        "final_composite.png - Final composite result\n"
+                        "README.txt - This file\n\n"
+                        "Processing details:\n"
+                        f"- Style: {style}\n"
+                        f"- Resolution: {'High-res (up to 8K)' if high_res_data else 'Preview resolution'}\n"
+                        f"- Generated by Lloyd's Anvilizer\n"
+                    )
+                    zf.writestr("README.txt", readme_content.encode('utf-8'))
+                
+                zip_buffer.seek(0)
+                
+                zip_buffer.seek(0)
+                return send_file(
+                    zip_buffer,
+                    mimetype='application/zip',
+                    as_attachment=True,
+                    download_name=f"{uid}_{style}_layers.zip"
+                )
+            else:
+                return jsonify({"status": "error", "error": "Invalid format"}), 400
+                
     except Exception as e:
         log_security_event(f"High-res processing error: {str(e)}", request.remote_addr)
-        return jsonify({
-            "status": "error", 
-            "error": str(e)
-        }), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 def process_highres_job(params):
@@ -1580,11 +1709,9 @@ def admin_queue_api():
 @require_admin_auth
 def admin_delete_session(uid):
     """Delete the whole session directory with security protection."""
-    # Validate UID format
-    try:
-        uid = validate_uid(uid)
-    except ValueError as e:
-        log_security_event(f"Invalid UID in admin delete: {str(e)}", request.remote_addr)
+    # Validate UID format inline
+    if not uid or not isinstance(uid, str) or len(uid) != 32 or not re.match(r'^[a-f0-9]{32}$', uid):
+        log_security_event(f"Invalid UID in admin delete: {uid}", request.remote_addr)
         return jsonify({"success": False, "error": "Invalid session ID"})
     
     from shutil import rmtree
@@ -1622,12 +1749,14 @@ def admin_log_image(filename):
 @require_admin_auth
 def admin_session_thumb(uid, style):
     """Serve a downsampled PNG for session preview style with security protection."""
-    # Validate UID and style name
-    try:
-        uid = validate_uid(uid)
-        style = validate_style_name(style)
-    except ValueError as e:
-        log_security_event(f"Invalid parameters in admin thumb: {str(e)}", request.remote_addr)
+    # Validate UID and style name inline
+    if not uid or not isinstance(uid, str) or len(uid) != 32 or not re.match(r'^[a-f0-9]{32}$', uid):
+        log_security_event(f"Invalid UID in admin thumb: {uid}", request.remote_addr)
+        return "Invalid parameters", 400
+    
+    allowed_styles = {'Flat', 'Stroke', 'Gradient', 'Window', 'Silhouette', 'Gradient Silhouette'}
+    if style not in allowed_styles:
+        log_security_event(f"Invalid style in admin thumb: {style}", request.remote_addr)
         return "Invalid parameters", 400
     
     session_dir = OUTPUT_DIR / uid
@@ -1646,38 +1775,18 @@ def admin_session_thumb(uid, style):
         return "Error", 500
 
 
-# Register job processors after they are defined
+# Register job processors with the queue system
 processor.register_processor('preview', process_preview_job)
-processor.register_processor('highres', process_highres_job)
 
 if __name__ == '__main__':
-    # Clean up old sessions on startup (24-hour retention)
+    # Clean up old sessions on startup
     cleanup_old_sessions(24)
-
-    # Get port from environment variable for Cloud Foundry deployment
-    import os
-    port = int(os.environ.get('PORT', 5000))
     
-    # Start the server - bind to all interfaces for Cloud Foundry
-    app.run(host='0.0.0.0', port=port, debug=False)
-
-# --- Removed Anvil Server Code ---
-# The code below seems to be for Anvil Uplink integration, not the main Flask app.
-# It's commented out to prevent conflicts or errors during local execution.
-#
-# from anvil.server import connect, callable, wait_forever
-# # Get your Uplink key from Anvil: App -> Publish -> Uplink Keys
-# connect("client_ZE2DGNINFHVVTD5PFMSITCJC-GSCAMTS7SZRVLCOH")
-# @callable
-# def apply_style(image_bytes: bytes) -> bytes:
-#     # Do your existing processing here, return processed image bytes (e.g., PNG)
-#     # Example skeleton:
-#     # from PIL import Image, ImageOps
-#     # import io
-#     # im = Image.open(io.BytesIO(image_bytes))
-#     # im = ImageOps.grayscale(im)
-#     # out = io.BytesIO()
-#     # im.save(out, format="PNG")
-#     # return out.getvalue()
-#     ...
-# wait_forever()
+    # Print startup information
+    print(f"Starting Lloyd's Anvilizer on http://127.0.0.1:5000")
+    print(f"Logs directory: {LOGS_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Images processed so far: {get_image_count()}")
+    
+    # Start the Flask development server
+    app.run(host='127.0.0.1', port=5000, debug=True, threaded=True)

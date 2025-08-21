@@ -150,48 +150,27 @@ def validate_numeric_parameter(value, param_name: str, min_val: float, max_val: 
     except (ValueError, TypeError):
         return default
 
-def validate_uid(uid: str) -> bool:
-    """
-    Validate UID format to prevent path traversal attacks.
-    
-    Args:
-        uid: User session identifier
-        
-    Returns:
-        True if valid, False otherwise
-    """
+def validate_uid(uid: str) -> str:
+    """Validate UID format to prevent path traversal attacks."""
     if not uid or not isinstance(uid, str):
-        return False
-    
-    # Check length (UUIDs are typically 32 hex chars)
+        raise ValueError("Invalid UID")
     if len(uid) != 32:
-        return False
-    
-    # Check for hex characters only
+        raise ValueError("Invalid UID length")
     if not re.match(r'^[a-f0-9]{32}$', uid):
-        return False
-    
-    # Prevent path traversal
+        raise ValueError("Invalid UID format")
     if '..' in uid or '/' in uid or '\\' in uid:
-        return False
-    
-    return True
+        raise ValueError("Path traversal attempt")
+    return uid
 
-def validate_style_name(style: str) -> bool:
-    """
-    Validate style name parameter.
-    
-    Args:
-        style: Style name
-        
-    Returns:
-        True if valid, False otherwise
-    """
+def validate_style_name(style: str) -> str:
+    """Validate style name parameter."""
     allowed_styles = {
         'Flat', 'Stroke', 'Gradient', 'Window', 
         'Silhouette', 'Gradient Silhouette'
     }
-    return style in allowed_styles
+    if style not in allowed_styles:
+        raise ValueError(f"Invalid style: {style}")
+    return style
 
 def validate_filename(filename: str) -> str:
     """

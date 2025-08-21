@@ -1233,10 +1233,21 @@ function startHighResProcessing(uid, style, format) {
         body: JSON.stringify(requestPayload)
     })
     .then(response => {
-        if (!response.ok) {
-            return response.json().then(err => Promise.reject(err));
+        // Check if response is JSON (error) or blob (success)
+        const contentType = response.headers.get("content-type");
+        
+        if (contentType && contentType.includes("application/json")) {
+            // JSON response indicates an error
+            return response.json().then(err => {
+                throw new Error(err.error || 'Processing failed');
+            });
+        } else {
+            // Non-JSON response should be the file blob
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            return response.blob();
         }
-        return response.blob();
     })
     .then(blob => {
         // Processing successful - trigger download
@@ -1290,11 +1301,7 @@ function startHighResProcessing(uid, style, format) {
             });
         }
         
-        // Show error details if available
-        if (error && error.error) {
-            alert('High-resolution processing failed: ' + error.error);
-        } else {
-            alert('High-resolution processing failed. Please try again.');
-        }
+        // Show error message
+        alert('High-resolution processing failed: ' + error.message);
     });
 }
