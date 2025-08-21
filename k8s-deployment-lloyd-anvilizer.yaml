@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lloyd-anvilizer-app
+  namespace: lloyd-anvilizer
+  labels:
+    app: lloyd-anvilizer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lloyd-anvilizer
+  template:
+    metadata:
+      labels:
+        app: lloyd-anvilizer
+    spec:
+      containers:
+      - name: lloyd-anvilizer
+        image: slurpeay/lloyd-anvilizer:latest
+        ports:
+        - containerPort: 5000
+        env:
+        - name: PORT
+          value: "5000"
+        - name: FLASK_ENV
+          value: "production"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: persistent-storage
+          mountPath: /logs
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: persistent-storage
+        persistentVolumeClaim:
+          claimName: lloyd-anvilizer-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lloyd-anvilizer-service
+  namespace: lloyd-anvilizer
+spec:
+  selector:
+    app: lloyd-anvilizer
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 5000
+  type: ClusterIP

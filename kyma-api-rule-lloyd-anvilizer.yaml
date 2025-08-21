@@ -1,0 +1,16 @@
+apiVersion: gateway.kyma-project.io/v1beta1
+kind: APIRule
+metadata:
+  name: lloyd-anvilizer-api-rule
+  namespace: lloyd-anvilizer
+spec:
+  gateway: kyma-gateway.kyma-system.svc.cluster.local
+  host: lloyd-anvilizer.a549aaa.kyma.ondemand.com
+  service:
+    name: lloyd-anvilizer-service
+    port: 80
+  rules:
+  - path: /.*
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+    accessStrategies:
+    - handler: noop

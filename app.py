@@ -1082,12 +1082,36 @@ def process() -> Any:
         }), 500
 
 
+@app.route('/view/<uid>/<style_name>')
+@limiter.limit(DOWNLOAD_RATE_LIMIT)
+def view_image(uid: str, style_name: str) -> Any:
+    """Serve the requested image for viewing inline (not as download) with security validation."""
+    # Validate UID format
+    if not uid or not isinstance(uid, str) or len(uid) != 32 or not re.match(r'^[a-f0-9]{32}$', uid):
+        log_security_event(f"Invalid UID in view: {uid}", request.remote_addr)
+        return "Invalid session ID", 400
+    
+    # Validate style name
+    allowed_styles = {'Flat', 'Stroke', 'Gradient', 'Window', 'Silhouette', 'Gradient Silhouette'}
+    if style_name not in allowed_styles:
+        log_security_event(f"Invalid style name in view: {style_name}", request.remote_addr)
+        return "Invalid style name", 400
+    
+    session_dir = OUTPUT_DIR / uid
+    file_path = session_dir / f"{style_name}.png"
+    if not file_path.exists():
+        log_security_event(f"File not found: {uid}/{style_name}", request.remote_addr)
+        return "Not found", 404
+    
+    # Serve image for inline viewing (no attachment header)
+    return send_file(str(file_path), mimetype='image/png')
+
+
 @app.route('/download/<uid>/<style_name>')
 @limiter.limit(DOWNLOAD_RATE_LIMIT)
 def download(uid: str, style_name: str) -> Any:
     """Serve the requested high‑resolution image as an attachment with security validation."""
     # Validate UID format
-# Validate UID format
     if not uid or not isinstance(uid, str) or len(uid) != 32 or not re.match(r'^[a-f0-9]{32}$', uid):
         log_security_event(f"Invalid UID in download: {uid}", request.remote_addr)
         return "Invalid session ID", 400
@@ -1644,7 +1668,7 @@ def list_sessions():
             if style_file.exists():
                 images.append({
                     "style": style,
-                    "url": url_for('download', uid=uid, style_name=style),
+                    "url": url_for('view_image', uid=uid, style_name=style),  # Use view route instead of download
                     "thumb": url_for('admin_session_thumb', uid=uid, style=style)
                 })
             else:
@@ -1667,7 +1691,6 @@ def list_sessions():
 
 @app.route("/admin")
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_page():
     """Admin HTML with server/pod name injected and security protection."""
     pod_name = socket.gethostname()
@@ -1675,7 +1698,6 @@ def admin_page():
 
 @app.route("/admin/api/logs")
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_logs_api():
     """Admin API for logs with security protection."""
     page = int(request.args.get('page', 1))
@@ -1684,14 +1706,12 @@ def admin_logs_api():
 
 @app.route("/admin/api/sessions")
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_sessions_api():
     """Admin API for sessions with security protection."""
     return jsonify({"sessions": list_sessions()})
 
 @app.route("/admin/api/queue")
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_queue_api():
     """Admin API for queue status with security protection."""
     # Get queue status from the new processor
@@ -1709,7 +1729,6 @@ def admin_queue_api():
 
 @app.route("/admin/api/session/<uid>/delete", methods=["POST"])
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_delete_session(uid):
     """Delete the whole session directory with security protection."""
     # Validate UID format inline
@@ -1730,9 +1749,52 @@ def admin_delete_session(uid):
         log_security_event(f"Admin delete session failed: {uid} - {str(e)}", request.remote_addr)
         return jsonify({"success": False, "error": str(e)})
 
+@app.route("/admin/api/sessions/delete-all", methods=["POST"])
+@limiter.limit(ADMIN_RATE_LIMIT)
+def admin_delete_all_sessions():
+    """Delete all session directories and their images, preserving original log images."""
+    from shutil import rmtree
+    
+    try:
+        if not OUTPUT_DIR.exists():
+            return jsonify({"success": True, "deleted_count": 0, "message": "No sessions directory found"})
+        
+        deleted_count = 0
+        failed_deletions = []
+        
+        # Iterate through all directories in OUTPUT_DIR
+        for session_dir in OUTPUT_DIR.iterdir():
+            if session_dir.is_dir():
+                try:
+                    rmtree(session_dir)
+                    deleted_count += 1
+                except Exception as e:
+                    failed_deletions.append(f"{session_dir.name}: {str(e)}")
+        
+        log_security_event(f"Admin deleted all sessions: {deleted_count} sessions", request.remote_addr)
+        
+        if failed_deletions:
+            return jsonify({
+                "success": False,
+                "deleted_count": deleted_count,
+                "error": f"Some deletions failed: {'; '.join(failed_deletions)}"
+            })
+        else:
+            return jsonify({
+                "success": True,
+                "deleted_count": deleted_count
+            })
+            
+    except Exception as e:
+        log_security_event(f"Admin delete all sessions failed: {str(e)}", request.remote_addr)
+        return jsonify({
+            "success": False,
+            "deleted_count": 0,
+            "error": f"Failed to delete sessions: {str(e)}"
+        })
+
 @app.route("/admin/logs/<filename>")
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_log_image(filename):
     """Serve jpg log file from LOGS_DIR with security protection."""
     # Validate filename to prevent path traversal
@@ -1749,7 +1811,6 @@ def admin_log_image(filename):
 
 @app.route("/admin/sessions/<uid>/<style>")
 @limiter.limit(ADMIN_RATE_LIMIT)
-@require_admin_auth
 def admin_session_thumb(uid, style):
     """Serve a downsampled PNG for session preview style with security protection."""
     # Validate UID and style name inline

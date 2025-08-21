@@ -14,6 +14,13 @@ document.addEventListener("DOMContentLoaded", function () {
  }
  }
  });
+
+ // Delete all sessions handler
+ document.getElementById("delete-all-sessions-btn").addEventListener("click", function (e) {
+ if (confirm("Delete ALL sessions and their images? This cannot be undone.\n\nNote: This will not delete original log images, only session processing results.")) {
+ deleteAllSessions();
+ }
+ });
 });
 
 // Thumbnails with pagination support
@@ -308,6 +315,27 @@ function deleteSession(uid) {
  .then(data => {
  alert(data.success ? "Session deleted." : "Failed to delete session: " + (data.error || ""));
  loadSessions();
+ });
+}
+
+function deleteAllSessions() {
+ const button = document.getElementById("delete-all-sessions-btn");
+ button.disabled = true;
+ button.textContent = "Deleting...";
+ 
+ fetch(`/admin/api/sessions/delete-all`, { method: "POST" })
+ .then(resp => resp.json())
+ .then(data => {
+ alert(data.success ? `Successfully deleted ${data.deleted_count} sessions.` : "Failed to delete sessions: " + (data.error || ""));
+ loadSessions();
+ })
+ .catch(error => {
+ console.error('Error deleting all sessions:', error);
+ alert("Error deleting sessions. Please try again.");
+ })
+ .finally(() => {
+ button.disabled = false;
+ button.textContent = "Delete All Sessions";
  });
 }
 
